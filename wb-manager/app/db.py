@@ -63,7 +63,6 @@ def init_db():
         INSERT OR IGNORE INTO settings (key, value) VALUES ('checkin_time', '08:30');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('quota_min_percent', '10');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('switch_enabled', '1');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('api_base', 'https://www.workbuddy.cn');
         """)
         # 轻量迁移：老库补列（幂等）
         cols = [r[1] for r in db.execute("PRAGMA table_info(accounts)")]
@@ -200,9 +199,22 @@ def pick_active_account(exclude_ids=None):
     3. 未查询过额度的账号（quota_checked_at 为空）不拦截
     4. 按 priority 升序取第一个（priority=1 是主账号）
     返回 dict 或 None
+
+    B6: 设置 switch_enabled='0'（自动切换关闭）时跳过第 2 步——只认优先级
+    第一的账号，耗尽也不顺延。该设置此前只存不用，关了也不生效。
     """
     exclude_ids = set(exclude_ids or [])
-    for acc in list_accounts(include_disabled=False):
+    accounts = list_accounts(include_disabled=False)
+    try:
+        switch_on = get_settings().get("switch_enabled", "1") != "0"
+    except Exception:
+        switch_on = True
+    if not switch_on:
+        for acc in accounts:
+            if acc["id"] not in exclude_ids:
+                return acc
+        return None
+    for acc in accounts:
         if acc["id"] in exclude_ids:
             continue
         # 已查询过额度且可用积分 <= 0 => 耗尽，跳过

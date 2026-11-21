@@ -14,6 +14,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
 from . import db
+from . import gateway_sync
 from . import scheduler
 from . import workbuddy_client as wb
 from . import oauth_login
@@ -97,7 +98,8 @@ class SettingsIn(BaseModel):
     checkin_time: str | None = None      # "HH:MM"
     quota_min_percent: float | None = None
     switch_enabled: str | None = None    # "1" / "0"
-    api_base: str | None = None
+    # B6: 原 api_base 字段已移除——客户端各接口地址是硬编码的不同域名，
+    # 这个设置从未被任何逻辑读取，留在 UI 里只会误导。
     wecom_webhook: str | None = None     # 企业微信群机器人 Webhook 地址（异常告警）
 
 
@@ -127,8 +129,19 @@ def api_usage(days: int = 7):
     by_model = collections.defaultdict(lambda: {"requests": 0, "tin": 0, "tout": 0})
     by_acc_model = collections.defaultdict(
         lambda: {"requests": 0, "tin": 0, "tout": 0, "failed": 0, "limited": 0})
-    recent = []
+    # C2: recent 只保留最后 50 条（日志按月分文件、文件内按时间追加，
+    # 迭代顺序即时间顺序，无需把窗口内全部记录读进内存再排序切片）
+    recent = collections.deque(maxlen=50)
     files = sorted(glob.glob(str(log_dir / "requests-*.jsonl")))
+    # C2: 先按文件名月份跳过整个窗口外的月文件，避免每次请求全量解析历史日志
+    since_month = since[:7]
+    def _file_month(fp):
+        base = os.path.basename(fp)
+        try:
+            return base[9:13] + "-" + base[13:15]
+        except Exception:
+            return ""
+    files = [fp for fp in files if _file_month(fp) >= since_month or not _file_month(fp)]
     if not files:
         # 静默返回空数组会让"路径配错"和"真的没有请求"无法区分，这里留一条告警。
         log.warning("用量统计未找到请求日志，log_dir=%s", log_dir)
@@ -170,7 +183,6 @@ def api_usage(days: int = 7):
                     recent.append(r)
             except Exception:
                 continue
-    recent.sort(key=lambda r: r.get("ts") or "")
 
     # 合并每日限额配置，给出使用率（限额未设/0 表示不限，使用率返回 null）
     limits = _load_usage_limits()
@@ -206,7 +218,7 @@ def api_usage(days: int = 7):
                      sorted(by_model.items(), key=lambda kv: -kv[1]["requests"])],
         "by_account_model": by_account_model,
         "limits": limits,
-        "recent": recent[-50:][::-1],
+        "recent": list(recent)[::-1],
     }
 
 
@@ -257,7 +269,8 @@ def api_accounts():
     known = [a["name"] for a in accounts]
     for g in _gateway_accounts():
         nm = (g.get("name") or "").strip()
-        if not nm or any(_name_match(nm, k) for k in known):
+        # B3: 与面板账号的同一性判定走唯一解析，前缀多命中时按未纳管显示，不误判
+        if not nm or _resolve_name(nm, known) is not None:
             continue
         accounts.append({
             "id": None, "name": nm, "user_id": "", "priority": g.get("priority", 100),
@@ -308,42 +321,19 @@ def api_delete_gateway_account(body: dict):
 
 @app.post("/api/accounts/{account_id}/checkin")
 def api_checkin_one(account_id: int):
-    """手动对单个账号签到（测试签到功能）"""
+    """手动对单个账号签到。
+
+    与定时签到共用 scheduler._checkin_one：此前这里另有一份签到后处理，
+    与调度器版本逐渐漂移（不置 error 状态、不刷到期时间），且 CLI 还有第三份。
+    统一后口径只有一处。
+    """
     acc = db.get_account(account_id)
     if not acc:
         raise HTTPException(404, "账号不存在")
-    ok, msg, reward, new_rt, total, streak = wb.checkin(acc["token"], acc["user_id"])
-    db.add_checkin_log(account_id, ok, msg, reward)
-    now = scheduler.time_str()
-    fields = {
-        "last_checkin_at": now,
-        "last_checkin_result": ("成功 " + (reward or msg)) if ok else ("失败 " + msg[:120]),
-    }
-    if new_rt and new_rt != acc["token"]:
-        fields["token"] = new_rt  # 令牌轮换回写
-    if ok:
-        # 连签天数以接口返回的真实值为准
-        if streak is not None:
-            fields["checkin_streak"] = streak
-        fields["status"] = "active"
-    # 签到接口的 total_credits 是累计总积分而非可用余额，
-    # 余额单独走 get-user-resource-summary 精确查询
-    cur_token = fields.get("token", acc["token"])
-    ok2, avail, granted, used, _m, new_rt2 = wb.query_available_credits(cur_token)
-    if new_rt2 and new_rt2 != cur_token:
-        fields["token"] = new_rt2
-    if ok2 and avail is not None:
-        if granted:
-            fields["quota_total"] = granted
-            fields["quota_used"] = used or 0
-        else:
-            fields["quota_total"] = avail
-            fields["quota_used"] = 0
-        fields["quota_checked_at"] = now
-    db.update_account(account_id, **fields)
-    return {"ok": ok, "message": msg, "reward": reward,
-            "total_credits": total, "streak_days": streak,
-            "available_credits": avail}
+    r = scheduler._checkin_one(acc, "manual-one")
+    return {"ok": r["ok"], "message": r["message"], "reward": r["reward"],
+            "total_credits": r.get("total_credits"), "streak_days": r.get("streak_days"),
+            "available_credits": r.get("available_credits")}
 
 
 @app.post("/api/accounts/{account_id}/refresh-quota")
@@ -367,6 +357,9 @@ def api_refresh_quota_one(account_id: int):
     if r["new_rt"] and r["new_rt"] != acc["token"]:
         fields["token"] = r["new_rt"]
     db.update_account(account_id, **fields)
+    # A1: 本侧轮换出的新令牌同步到网关池
+    if fields.get("token") and fields["token"] != acc["token"]:
+        gateway_sync.sync_gateway_rt(acc["name"], fields["token"])
     return {"ok": r["ok"], "quota_total": r["available"],
             "granted_total": r["granted"], "used_total": r["used"],
             "expire_at": r["expire_at"], "days_left": r["days_left"], "message": r["msg"]}
@@ -379,11 +372,8 @@ def api_refresh_quota_one(account_id: int):
 # 结果面板显示"已切换"、网关却纹丝不动。
 
 def _rotator_home():
-    """rotator 数据目录：容器内由 WB_ROTATOR_HOME 指定，本地开发回退源码树"""
-    home = os.environ.get("WB_ROTATOR_HOME", "").strip()
-    if home:
-        return Path(home)
-    return Path(__file__).resolve().parent.parent.parent / "wb-rotator"
+    """rotator 数据目录（与 app/gateway_sync.py 同一解析规则）"""
+    return gateway_sync.rotator_home()
 
 
 def _pin_file():
@@ -430,19 +420,25 @@ def _gateway_accounts():
 
     面板的 status 与网关的 disabled 是两套独立状态：账号可能在面板里正常，
     但网关侧被禁用而跳过。必须读出来才能解释"切过去却没用上"。
+    B2: 返回前按 (priority, name) 排序——选号顺序以 priority 字段为准，
+    不依赖文件物理顺序（OAuth 入库是 append，文件顺序≠优先级顺序）。
     """
     try:
         with open(_rotator_home() / "accounts.json", encoding="utf-8") as f:
             d = json.load(f) or {}
     except Exception:
         return []
-    return d if isinstance(d, list) else (d.get("accounts") or [])
+    accs = d if isinstance(d, list) else (d.get("accounts") or [])
+    accs = [a for a in accs if isinstance(a, dict)]
+    accs.sort(key=lambda a: (a.get("priority", 100), a.get("name") or ""))
+    return accs
 
 
 def _remove_gateway_account(name: str) -> bool:
     """从 rotator 的 accounts.json 删除指定 name 的「仅代理」账号。
 
-    采用与 rotator 自身 save_accounts 一致的原子写（临时文件 + os.replace）。
+    采用与 rotator 自身 save_accounts 一致的原子写（临时文件 + os.replace），
+    且整段读-改-写持有跨进程文件锁（A2：网关进程可能同时在回写轮换令牌）。
     返回 True 表示确有删除；若池中不存在该账号返回 False。
     若被删账号恰是当前 pin（手动置顶）账号，顺手清理 pin.json，
     避免 rotator 在选号时仍指向已删除的账号。
@@ -450,22 +446,22 @@ def _remove_gateway_account(name: str) -> bool:
     target = (name or "").strip()
     if not target:
         return False
-    try:
-        path = _rotator_home() / "accounts.json"
-        with open(path, encoding="utf-8") as f:
-            raw = json.load(f) or {}
-    except Exception:
-        return False
-    is_list = isinstance(raw, list)
-    lst = raw if is_list else (raw.get("accounts") or [])
-    new_lst = [a for a in lst if (a.get("name") or "").strip() != target]
-    if len(new_lst) == len(lst):
-        return False
-    out = new_lst if is_list else {"accounts": new_lst}
-    tmp = str(path) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, str(path))
+    with gateway_sync.gateway_file_lock() as path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f) or {}
+        except Exception:
+            return False
+        is_list = isinstance(raw, list)
+        lst = raw if is_list else (raw.get("accounts") or [])
+        new_lst = [a for a in lst if (a.get("name") or "").strip() != target]
+        if len(new_lst) == len(lst):
+            return False
+        out = new_lst if is_list else {"accounts": new_lst}
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, str(path))
     # 清理 pin（若存在且指向被删账号）
     try:
         pf = _pin_file()
@@ -496,6 +492,21 @@ def _name_match(a, b):
     return a == b or a.startswith(b) or b.startswith(a)
 
 
+def _resolve_name(target, candidates):
+    """B3: 在候选名集合中把 target 解析为唯一账号名（与 rotator.resolve_name 同规则）。
+
+    _name_match 是成对比较，「备用1」对「备用10」也算命中，多候选时会串号。
+    按名找唯一账号的路径必须先经这里：全等优先，前缀仅唯一命中时生效。
+    """
+    if not target:
+        return None
+    cands = [c for c in candidates if c]
+    if target in cands:
+        return target
+    hits = [c for c in cands if c.startswith(target) or target.startswith(c)]
+    return hits[0] if len(hits) == 1 else None
+
+
 @app.get("/api/pin-account")
 def api_get_pin():
     """当前手动置顶的代理账号（读 rotator 的 pin.json）"""
@@ -516,9 +527,12 @@ def api_set_pin(body: dict):
     pin_file = _pin_file()
     if name:
         pin_file.parent.mkdir(parents=True, exist_ok=True)
-        # 用 with 确保句柄及时关闭：rotator 每次选号都会立刻重新解析该文件
-        with open(pin_file, "w", encoding="utf-8") as f:
+        # 原子写（tmp + replace），与本文件其他 JSON 写入口径一致：
+        # rotator 每次选号都会立刻重新解析该文件，不能让它读到半截内容
+        tmp = str(pin_file) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"name": name, "at": scheduler.time_str()}, f, ensure_ascii=False)
+        os.replace(tmp, str(pin_file))
     elif pin_file.exists():
         pin_file.unlink()  # 清除置顶，恢复按优先级自动选择
     return {"ok": True, "pinned": name, "path": str(pin_file)}
@@ -569,29 +583,29 @@ def api_set_settings(s: SettingsIn):
 # ---------- 额度自动切换 API（核心） ----------
 
 def _gateway_state(name):
-    """该账号在网关池里的记录；None 表示网关池中没有同名账号"""
-    for a in _gateway_accounts():
-        if _name_match(a.get("name"), name):
-            return a
-    return None
+    """该账号在网关池里的记录；None 表示网关池中没有该账号（B3: 唯一解析）"""
+    return gateway_sync.find_pool_entry(_gateway_accounts(), name)
 
 
 def _pick_gateway_active():
-    """按网关的真实规则选号：accounts.json 已按 priority 排序，
+    """按网关的真实规则选号：accounts.json 已按 priority 排序（_gateway_accounts 保证），
     跳过「网关侧禁用」和「额度耗尽」的账号，取第一个能用的。
     面板自己的 pick_active_account 不知道网关的 disabled，不能拿来替代。
+    面板↔网关的名字配对走唯一解析（B3），前缀多命中时跳过该网关条目，不猜。
     """
     panel = db.list_accounts(include_disabled=False)
+    panel_names = [a["name"] for a in panel]
     for g in _gateway_accounts():
         if g.get("disabled"):
             continue
-        for a in panel:
-            if not _name_match(a["name"], g.get("name")):
-                continue
-            avail = db.account_available_credits(a)
-            if avail is not None and avail <= 0:
-                break
-            return a
+        pname = _resolve_name(g.get("name") or "", panel_names)
+        if not pname:
+            continue
+        a = next(x for x in panel if x["name"] == pname)
+        avail = db.account_available_credits(a)
+        if avail is not None and avail <= 0:
+            continue
+        return a
     return None
 
 
@@ -611,12 +625,14 @@ def api_active_account():
         if pin_gw and pin_gw.get("disabled"):
             warning = "置顶账号「%s」在网关侧已禁用" % pinned
         else:
-            for a in db.list_accounts(include_disabled=False):
-                if _name_match(a["name"], pinned):
-                    avail = db.account_available_credits(a)
-                    if avail is None or avail > 0:
-                        acc = a
-                    break
+            # B3: 置顶名先在面板账号里唯一解析，再取该账号（防前缀串号）
+            panel = db.list_accounts(include_disabled=False)
+            pname = _resolve_name(pinned, [a["name"] for a in panel])
+            if pname:
+                cand = next(a for a in panel if a["name"] == pname)
+                avail = db.account_available_credits(cand)
+                if avail is None or avail > 0:
+                    acc = cand
             if acc is None and pin_gw:
                 # 仅存在于网关池的账号（面板没有独立令牌）：用网关记录合成一条，
                 # 否则置顶它之后横幅会错误地回退显示别的账号。
@@ -645,7 +661,8 @@ def api_active_account():
         acc["quota_percent"] = db.account_quota_percent(acc)
         acc["available_credits"] = db.account_available_credits(acc)
         acc["token"] = acc["token"][:8] + "****"
-    acc["pinned"] = bool(pinned) and _name_match(acc["name"], pinned)
+    acc["pinned"] = bool(pinned) and _resolve_name(
+        pinned, [acc["name"]]) == acc["name"]
     gw = _gateway_state(acc["name"])
     acc["gateway_disabled"] = bool(gw.get("disabled")) if gw else None
     return {"active": acc, "pinned": pinned, "warning": warning}
@@ -668,34 +685,36 @@ class LoginStartIn(BaseModel):
 
 
 def _write_gateway_account(name, rt, priority=100):
-    """把账号写入 rotator 的 accounts.json；同名更新令牌，否则追加。"""
-    path = _rotator_home() / "accounts.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = json.load(f) or {}
-    except Exception:
-        raw = {}
-    accs = raw if isinstance(raw, list) else (raw.get("accounts") or [])
+    """把账号写入 rotator 的 accounts.json；同名更新令牌，否则追加。
 
-    target = next((a for a in accs if (a.get("name") or "") == name), None)
-    if target is None:
-        target = next((a for a in accs if _name_match(a.get("name") or "", name)), None)
-    if target is None:
-        accs.append({"name": name, "refresh_token": rt, "priority": priority,
-                     "exhausted_date": "", "disabled": False})
-        action = "added"
-    else:
-        target["refresh_token"] = rt
-        target["disabled"] = False
-        target["exhausted_date"] = ""
-        action = "updated"
+    整段读-改-写持有跨进程文件锁（A2）；同名判定走 gateway_sync 的
+    全等优先/前缀唯一规则（B3），前缀多命中时按新账号追加，不误伤同名前缀的账号。
+    """
+    with gateway_sync.gateway_file_lock() as path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f) or {}
+        except Exception:
+            raw = {}
+        accs = raw if isinstance(raw, list) else (raw.get("accounts") or [])
 
-    tmp = str(path) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"accounts": accs}, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-    return action
+        target = gateway_sync.find_pool_entry(accs, name)
+        if target is None:
+            accs.append({"name": name, "refresh_token": rt, "priority": priority,
+                         "exhausted_date": "", "disabled": False})
+            action = "added"
+        else:
+            target["refresh_token"] = rt
+            target["disabled"] = False
+            target["exhausted_date"] = ""
+            action = "updated"
+
+        out = accs if isinstance(raw, list) else {"accounts": accs}
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, str(path))
+        return action
 
 
 def _import_oauth_account(cred):
@@ -775,4 +794,7 @@ def api_switch_consume(req: SwitchRequest):
 
 # ---------- 静态资源 ----------
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# 静态目录按文件位置解析，不依赖启动时的工作目录（此前相对路径 "static"
+# 要求进程必须从 wb-manager/ 启动，换个 CWD 直接 RuntimeError 起不来）
+_STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")

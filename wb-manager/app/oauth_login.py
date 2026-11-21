@@ -169,11 +169,12 @@ def poll(state):
     except Exception:
         pass  # 资料接口失败不阻断入库，名称由调用方兜底
 
-    s["credential"] = {
-        "realm": s["realm"], "name": s["name"], "priority": s["priority"],
-        "refresh_token": rt, "expires_at": _pick(d, "expiresAt", "expires_at"),
-        "domain": _pick(d, "domain") or cfg["domain"], "profile": profile,
-    }
+    with _lock:
+        s["credential"] = {
+            "realm": s["realm"], "name": s["name"], "priority": s["priority"],
+            "refresh_token": rt, "expires_at": _pick(d, "expiresAt", "expires_at"),
+            "domain": _pick(d, "domain") or cfg["domain"], "profile": profile,
+        }
     return _ok_payload(s)
 
 

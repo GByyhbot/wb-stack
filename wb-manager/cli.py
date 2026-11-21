@@ -56,21 +56,13 @@ def cmd_checkin(args):
         if not acc:
             print(f"❌ 账号 id={args.id} 不存在")
             return
-        ok, msg, reward, new_rt, total, streak = wb.checkin(acc["token"], acc["user_id"])
-        fields = {"last_checkin_at": scheduler.time_str(),
-                  "last_checkin_result": ("成功" if ok else "失败 " + msg[:100])}
-        if new_rt and new_rt != acc["token"]:
-            fields["token"] = new_rt  # 令牌轮换回写
-        if total is not None:
-            fields["quota_total"] = total
-            fields["quota_used"] = 0
-            fields["quota_checked_at"] = scheduler.time_str()
-        if ok and streak is not None:
-            fields["checkin_streak"] = streak
-        db.add_checkin_log(acc["id"], ok, msg, reward)
-        db.update_account(acc["id"], **fields)
-        bal = f"（余额 {total:.0f}）" if total is not None else ""
-        print(f"{'✅ 签到成功' if ok else '❌ 签到失败'}: {acc['name']} -> {msg} {reward}{bal}")
+        # 与 Web/定时签到共用同一后处理（scheduler._checkin_one）。
+        # 此前这里单独一份，把签到接口的【累计总积分】写进 quota_total 冒充
+        # 可用余额——正是全仓反复警示的口径错误，会污染面板积分与选号，
+        # 直到下个整点额度刷新才自愈。统一后口径只有一处。
+        r = scheduler._checkin_one(acc, "cli")
+        bal = f"（可用积分 {r['available_credits']:.0f}）" if r.get("available_credits") is not None else ""
+        print(f"{'✅ 签到成功' if r['ok'] else '❌ 签到失败'}: {acc['name']} -> {r['message']} {r['reward']}{bal}")
     else:
         results = scheduler.run_checkin_all(trigger_source="cli")
         for r in results:
@@ -83,8 +75,9 @@ def cmd_quota(args):
     accounts = db.list_accounts()
     print(f"{'ID':<4}{'名称':<14}{'积分余额':<12}{'状态':<10}{'余额更新时间'}")
     for a in accounts:
-        total = a['quota_total'] or 0
-        ts = f"{total:.0f}" if a['quota_checked_at'] else "未查询"
+        # 积分余额 = 可用积分（总发放 - 已用），不是 quota_total（总发放）
+        avail = db.account_available_credits(a)
+        ts = f"{avail:.0f}" if avail is not None else "未查询"
         print(f"{a['id']:<4}{a['name']:<14}{ts:<12}{a['status']:<10}{a['quota_checked_at'] or '-'}")
 
 
@@ -93,8 +86,8 @@ def cmd_switch(args):
     if not acc:
         print("❌ 没有可用账号（全部积分耗尽或停用）")
         return
-    total = acc['quota_total'] or 0
-    ts = f"{total:.0f} 积分" if acc['quota_checked_at'] else "未查询"
+    avail = db.account_available_credits(acc)
+    ts = f"{avail:.0f} 积分" if avail is not None else "未查询"
     print(f"📌 当前应使用: id={acc['id']} {acc['name']} (priority={acc['priority']}) 积分余额: {ts}")
 
 

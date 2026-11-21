@@ -12,6 +12,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from . import db
+from . import gateway_sync
 from . import workbuddy_client as wb
 
 log = logging.getLogger("wb-manager.scheduler")
@@ -54,7 +55,13 @@ def run_checkin_all(trigger_source="manual"):
 
 
 def _checkin_one(acc, trigger_source):
-    """单账号签到流程；任何异常由 run_checkin_all 兜底，不在此吞掉"""
+    """单账号签到流程；任何异常由 run_checkin_all 兜底，不在此吞掉。
+
+    Web 手动签到与 CLI 单账号签到也统一走这里——此前三处各有一份
+    签到后处理，CLI 那份还把累计总积分写进了 quota_total（口径事故）。
+    返回值在原 {account, ok, message, reward} 基础上附加
+    total_credits / streak_days / available_credits，供 API 层组装响应。
+    """
     ok, msg, reward, new_rt, total, streak = wb.checkin(acc["token"], acc["user_id"])
     now = time_str()
     db.add_checkin_log(acc["id"], ok, msg, reward)
@@ -65,6 +72,7 @@ def _checkin_one(acc, trigger_source):
     # 令牌轮换：必须回写新的 refresh_token，否则下次刷新会失效
     if new_rt and new_rt != acc["token"]:
         fields["token"] = new_rt
+    avail = None
     if ok:
         # 连签天数以接口返回的真实值为准，避免本地累加漂移
         if streak is not None:
@@ -87,8 +95,12 @@ def _checkin_one(acc, trigger_source):
         if "刷新失败" in msg or "认证" in msg:
             fields["status"] = "error"
     db.update_account(acc["id"], **fields)
+    # A1: 本侧轮换出的新令牌同步到网关池，避免两边各存一代互相刷死
+    if fields.get("token") and fields["token"] != acc["token"]:
+        gateway_sync.sync_gateway_rt(acc["name"], fields["token"])
     log.info("[%s] 签到 %s -> %s %s", trigger_source, acc["name"], "OK" if ok else "FAIL", msg)
-    return {"account": acc["name"], "ok": ok, "message": msg, "reward": reward}
+    return {"account": acc["name"], "ok": ok, "message": msg, "reward": reward,
+            "total_credits": total, "streak_days": streak, "available_credits": avail}
 
 
 def notify_wecom(title, content):
@@ -99,7 +111,7 @@ def notify_wecom(title, content):
     import json as _json
     import urllib.request as _ur
     payload = {"msgtype": "markdown",
-               "markdown": {"content": "**[WB-Manger] %s**\n%s" % (title, content)}}
+               "markdown": {"content": "**[WB-Manager] %s**\n%s" % (title, content)}}
     try:
         req = _ur.Request(webhook, data=_json.dumps(payload).encode(), method="POST",
                           headers={"Content-Type": "application/json"})
@@ -112,45 +124,75 @@ def notify_wecom(title, content):
 
 
 def run_quota_refresh():
-    """刷新全部 active 账号的额度信息（get-user-resource-summary，真实可用积分+到期时间）"""
-    for acc in db.list_accounts(include_disabled=False):
-        r = wb.query_quota_full(acc["token"])
-        now = time_str()
-        fields = {"quota_checked_at": now}
-        prev_status = acc.get("status")
-        if r["ok"] and r["available"] is not None:
-            if r["granted"]:
-                fields["quota_total"] = r["granted"]
-                fields["quota_used"] = r["used"] or 0
-            else:
-                fields["quota_total"] = r["available"]
-                fields["quota_used"] = 0
-            fields["status"] = "active"
-            if r["expire_at"]:
-                fields["quota_expire_at"] = r["expire_at"]
-        elif "刷新失败" in r["msg"] or "认证" in r["msg"]:
-            fields["status"] = "error"
-        if r["new_rt"] and r["new_rt"] != acc["token"]:
-            fields["token"] = r["new_rt"]
-        db.update_account(acc["id"], **fields)
+    """刷新全部 active 账号的额度信息（get-user-resource-summary，真实可用积分+到期时间）。
 
-        # 告警1：账号由正常转异常（每账号每自然日最多提醒一次）
-        if fields.get("status") == "error" and prev_status == "active":
-            st = db.get_settings()
-            if st.get("token_alert_date") != now[:10]:
-                db.set_setting("token_alert_date", now[:10])
-                notify_wecom("⚠️ 账号 Token 异常",
-                             "账号「%s」刷新失败：%s\n请重新导出令牌并更新。" % (acc["name"], r["msg"][:120]))
-        # 告警2：积分 3 天内到期（每自然日最多提醒一次）
-        if (r["ok"] and r["days_left"] is not None and r["days_left"] <= 3
-                and (r["available"] or 0) > 0):
-            st = db.get_settings()
-            if st.get("expiry_alert_date") != now[:10]:
-                db.set_setting("expiry_alert_date", now[:10])
-                notify_wecom("⏳ 积分即将到期",
-                             "账号「%s」的 %s 可用积分将于 %s 到期（还剩 %s 天），建议优先使用该账号。"
-                             % (acc["name"], r["available"], r["expire_at"], r["days_left"]))
-        log.info("额度刷新 %s -> ok=%s 可用=%s 到期=%s", acc["name"], r["ok"], r["available"], r["expire_at"])
+    B5: 与签到路径一样做单账号异常兜底——此前任一账号落库抛异常会中断
+    整批刷新与后续账号的告警，健壮性口径与 run_checkin_all 对齐。
+    """
+    for acc in db.list_accounts(include_disabled=False):
+        try:
+            _refresh_one_quota(acc)
+        except Exception:
+            log.exception("额度刷新异常 %s", acc["name"])
+
+
+def _refresh_one_quota(acc):
+    r = wb.query_quota_full(acc["token"])
+    now = time_str()
+    fields = {"quota_checked_at": now}
+    prev_status = acc.get("status")
+    if r["ok"] and r["available"] is not None:
+        if r["granted"]:
+            fields["quota_total"] = r["granted"]
+            fields["quota_used"] = r["used"] or 0
+        else:
+            fields["quota_total"] = r["available"]
+            fields["quota_used"] = 0
+        fields["status"] = "active"
+        if r["expire_at"]:
+            fields["quota_expire_at"] = r["expire_at"]
+    elif "刷新失败" in r["msg"] or "认证" in r["msg"]:
+        fields["status"] = "error"
+    if r["new_rt"] and r["new_rt"] != acc["token"]:
+        fields["token"] = r["new_rt"]
+    db.update_account(acc["id"], **fields)
+    # A1: 本侧轮换出的新令牌同步到网关池
+    if fields.get("token") and fields["token"] != acc["token"]:
+        gateway_sync.sync_gateway_rt(acc["name"], fields["token"])
+
+    st = db.get_settings()
+    # 告警1：账号由正常转异常（每账号每自然日最多提醒一次）
+    if fields.get("status") == "error" and prev_status == "active":
+        if st.get("token_alert_date") != now[:10]:
+            db.set_setting("token_alert_date", now[:10])
+            notify_wecom("⚠️ 账号 Token 异常",
+                         "账号「%s」刷新失败：%s\n请重新导出令牌并更新。" % (acc["name"], r["msg"][:120]))
+    # 告警2：积分 3 天内到期（每自然日最多提醒一次）
+    if (r["ok"] and r["days_left"] is not None and r["days_left"] <= 3
+            and (r["available"] or 0) > 0):
+        if st.get("expiry_alert_date") != now[:10]:
+            db.set_setting("expiry_alert_date", now[:10])
+            notify_wecom("⏳ 积分即将到期",
+                         "账号「%s」的 %s 可用积分将于 %s 到期（还剩 %s 天），建议优先使用该账号。"
+                         % (acc["name"], r["available"], r["expire_at"], r["days_left"]))
+    # 告警3（B6 落地）：可用积分占比低于设置阈值 quota_min_percent（每账号每日最多一次）。
+    # 该设置此前只存不用，面板上调了也不生效。
+    if r["ok"] and r["available"] is not None:
+        try:
+            threshold = float(st.get("quota_min_percent") or 0)
+        except (TypeError, ValueError):
+            threshold = 0
+        merged = dict(acc)
+        merged.update(fields)
+        pct = db.account_quota_percent(merged)
+        if threshold > 0 and pct is not None and pct <= threshold and (r["available"] or 0) > 0:
+            key = "low_quota_alert_date:%s" % acc["id"]
+            if st.get(key) != now[:10]:
+                db.set_setting(key, now[:10])
+                notify_wecom("🪫 积分余额偏低",
+                             "账号「%s」可用积分占比 %.0f%%（%s 分），已低于告警阈值 %.0f%%。"
+                             % (acc["name"], pct, r["available"], threshold))
+    log.info("额度刷新 %s -> ok=%s 可用=%s 到期=%s", acc["name"], r["ok"], r["available"], r["expire_at"])
 
 
 def _cron_from_hhmm(hhmm):

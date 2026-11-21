@@ -50,7 +50,7 @@
 
 - 账号的 `token` 字段保存的是 **长效令牌（refresh token）**，不是短效 access token。
 - 官方 refresh token 是**轮换型**：每次刷新会返回新的 refresh token，平台自动回写数据库。
-- **同一把 refresh token 只能在一处使用**：如果同一账号同时配置在本平台和签到技能里，两边会互相刷新导致另一边失效。多账号请各自导出独立的 refresh token。
+- **同一把 refresh token 只能在一处使用**——例外只有本平台与 wb-rotator 网关这一对：两边双写同一账号令牌时已实现双向同步（谁刷新谁把新令牌同步到另一份存储，见 `app/gateway_sync.py` 与 rotator 的 `_sync_panel_db`），不会再各存一代互相刷死。但若同一账号还同时配置在签到技能等**栈外第三方**，仍会互相刷新导致失效——多账号请各自导出独立的 refresh token，栈外一处一个。
 - 新增账号：在已登录 WorkBuddy 的电脑上运行
   `python ~/.workbuddy/skills/totorosir-workbuddy-checkin__skillhub/scripts/rt_auth.py --export-rt`
   （明文输出到终端，复制后在本平台 Web 界面添加账号时粘贴到 Token 栏）。
@@ -91,3 +91,12 @@ cd /vol1/1000/apps/wb-manager
 - 代码：`/vol1/1000/apps/wb-manager/`
 - 数据库（SQLite/WAL）：`/vol1/1000/apps/wb-manager/data/wb_manager.db`
 - systemd 单元：`/etc/systemd/system/wb-manager.service`
+
+## 回归测试
+
+仓库根目录 `tests/` 有离线回归测试（2026-11-21 审计修复批配套，上游接口全 mock）：
+
+```bash
+pip install -r wb-manager/requirements.txt pytest
+python -m pytest tests -q
+```

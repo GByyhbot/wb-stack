@@ -270,7 +270,6 @@
           <div><label>每日签到时间（随机抖动 ±30 分钟）</label><input id="s_checkin_time" placeholder="08:30"></div>
           <div><label>余额告警阈值 (%)</label><input id="s_quota_min" type="number" placeholder="10"></div>
           <div><label>自动切换</label><select id="s_switch"><option value="1">开启</option><option value="0">关闭</option></select></div>
-          <div><label>API 地址（固定值）</label><input id="s_api" placeholder="https://www.workbuddy.cn"></div>
           <div style="grid-column: span 2;"><label>企业微信机器人 Webhook（异常/到期告警，留空不通知）</label><input id="s_wecom" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"></div>
         </div>
         <button class="btn btn-primary" onclick="saveSettings()">保存设置</button>
@@ -347,6 +346,8 @@ function expBadge(a) {
   if (d <= 3) return `<span style="color:var(--yellow)">⏳ ${txt}（${d}天）</span>`;
   return `<span>⏳ ${txt}</span>`;
 }
+function pinAccountByIdx(i) { const a = ACCOUNTS[i]; if (a) pinAccount(a.name); }
+function delAccountByIdx(i) { const a = ACCOUNTS[i]; if (a) delAccount(a.id, a.name); }
 async function pinAccount(name) {
   const d = await req('POST', '/api/pin-account', { name });
   pinnedName = d.pinned;
@@ -400,26 +401,26 @@ async function loadAccounts() {
       </div>`;
     const actions = go
       ? `<div class="acc-actions">
-        <button class="btn ${pinnedName === a.name ? 'btn-primary' : ''}" onclick="pinAccount('${a.name}')" title="手动切换：让代理优先使用该账号">
+        <button class="btn ${pinnedName === a.name ? 'btn-primary' : ''}" onclick="pinAccountByIdx(${i})" title="手动切换：让代理优先使用该账号">
           ${pinnedName === a.name ? '📍 当前使用' : '📌 设为当前'}</button>
-        <button class="btn btn-danger" onclick="delAccount(null,'${a.name}')">删除</button>
+        <button class="btn btn-danger" onclick="delAccountByIdx(${i})">删除</button>
       </div>`
       : `<div class="acc-actions">
-        <button class="btn ${pinnedName === a.name ? 'btn-primary' : ''}" onclick="pinAccount('${a.name}')" title="手动切换：让代理优先使用该账号">
+        <button class="btn ${pinnedName === a.name ? 'btn-primary' : ''}" onclick="pinAccountByIdx(${i})" title="手动切换：让代理优先使用该账号">
           ${pinnedName === a.name ? '📍 当前使用' : '📌 设为当前'}</button>
         <button class="btn" onclick="checkinOne(${a.id})">签到</button>
         <button class="btn" onclick="refreshQuota(${a.id})">余额</button>
         <button class="btn" onclick="validateOne(${a.id})">验证</button>
         <button class="btn ${a.status==='active'?'btn-danger':''}" onclick="toggleStatus(${a.id},'${a.status}')">${a.status==='active'?'停用':'启用'}</button>
-        <button class="btn btn-danger" onclick="delAccount(${a.id},'${a.name}')">删除</button>
+        <button class="btn btn-danger" onclick="delAccountByIdx(${i})">删除</button>
       </div>`;
     return `
     <div class="acc-card ${a.priority === 1 ? 'current' : ''} ${go ? 'gateway-only' : ''}">
       <div class="acc-top">
         <div class="avatar" style="background:${color}">${(a.name||'?').replace(/[^0-9A-Za-z\u4e00-\u9fa5]/g,'').slice(-1) || '?'}</div>
         <div>
-          <div class="acc-name">${a.priority === 1 ? '⭐ ' : ''}${a.name}</div>
-          <div class="acc-uid">${a.user_id || (go ? 'gateway pool' : '-')}</div>
+          <div class="acc-name">${a.priority === 1 ? '⭐ ' : ''}${esc(a.name)}</div>
+          <div class="acc-uid">${esc(a.user_id || (go ? 'gateway pool' : '-'))}</div>
         </div>
         ${pill}
       </div>
@@ -441,11 +442,11 @@ async function loadActive() {
     const credits = a.available_credits ?? Math.max(0, (a.quota_total || 0) - (a.quota_used || 0));
     const pct = (a.quota_percent != null) ? ` · 额度 ${Math.round(a.quota_percent)}%` : '';
     const pin = a.pinned ? '<span class="pin-badge">📌 置顶</span>' : '';
-    const warn = d.warning ? `<div class="warn">⚠️ ${d.warning}</div>` : '';
+    const warn = d.warning ? `<div class="warn">⚠️ ${esc(d.warning)}</div>` : '';
     document.getElementById('activeBanner').innerHTML =
       `<span class="dot"></span>` +
       `<span class="lbl">当前业务账号</span>` +
-      `<span class="nm">${a.name}</span>${pin}` +
+      `<span class="nm">${esc(a.name)}</span>${pin}` +
       `<span class="meta">优先级 ${a.priority}${pct}<br>可用积分 <b>${Number(credits).toFixed(2)}</b></span>` +
       warn;
   } catch (e) {
@@ -530,8 +531,8 @@ async function loadUsage() {
       tb.innerHTML = d.recent.map(r => `
         <tr>
           <td class="muted">${(r.ts || '').slice(5, 16)}</td>
-          <td>${r.account || '-'}</td>
-          <td class="code">${r.model || '-'}</td>
+          <td>${esc(r.account || '-')}</td>
+          <td class="code">${esc(r.model || '-')}</td>
           <td class="${r.status === 200 ? 'log-ok' : 'log-fail'}">${r.status}</td>
           <td class="muted">${((r.duration_ms||0)/1000).toFixed(1)}s</td>
           <td class="muted">${fmtTokens((r.prompt_tokens||0) + (r.completion_tokens||0))}</td>
@@ -574,9 +575,9 @@ async function loadLogs() {
   const tb = document.getElementById('logTable');
   if (!d.logs.length) { tb.innerHTML = '<tr><td colspan="5" class="muted">暂无日志</td></tr>'; return; }
   tb.innerHTML = d.logs.map(l => `
-    <tr><td class="muted">${l.created_at}</td><td>${l.account_name || l.account_id}</td>
+    <tr><td class="muted">${l.created_at}</td><td>${esc(l.account_name || l.account_id)}</td>
     <td class="${l.ok ? 'log-ok' : 'log-fail'}">${l.ok ? '✔ 成功' : '✘ 失败'}</td>
-    <td class="muted">${(l.message || '').slice(0, 60)}</td><td>${l.reward || '-'}</td></tr>`).join('');
+    <td class="muted">${esc((l.message || '').slice(0, 60))}</td><td>${esc(l.reward || '-')}</td></tr>`).join('');
 }
 async function loadSettings() {
   const d = await req('GET', '/api/settings');
@@ -584,7 +585,6 @@ async function loadSettings() {
   document.getElementById('s_checkin_time').value = s.checkin_time || '';
   document.getElementById('s_quota_min').value = s.quota_min_percent || '';
   document.getElementById('s_switch').value = s.switch_enabled || '1';
-  document.getElementById('s_api').value = s.api_base || '';
   document.getElementById('s_wecom').value = s.wecom_webhook || '';
 }
 
@@ -714,6 +714,7 @@ async function checkinAll() {
 async function refreshAllQuota() {
   const d = await req('GET', '/api/accounts');
   for (const a of d.accounts) {
+    if (a.id == null) continue;   // 仅代理池账号没有面板令牌，跳过
     try { await req('POST', `/api/accounts/${a.id}/refresh-quota`); } catch (e) {}
   }
   toast('可用积分刷新完成'); loadAccounts(); loadActive();
@@ -723,7 +724,6 @@ async function saveSettings() {
     checkin_time: document.getElementById('s_checkin_time').value.trim(),
     quota_min_percent: parseFloat(document.getElementById('s_quota_min').value) || 10,
     switch_enabled: document.getElementById('s_switch').value,
-    api_base: document.getElementById('s_api').value.trim(),
     wecom_webhook: document.getElementById('s_wecom').value.trim(),
   });
   toast('设置已保存');
