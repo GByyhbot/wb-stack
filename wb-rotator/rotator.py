@@ -59,7 +59,12 @@ AUTH_KEY = os.environ.get("WB_ROTATOR_KEY", "")
 
 
 def _require_auth(handler):
-    if not AUTH_KEY or handler.headers.get("Authorization", "") == "Bearer " + AUTH_KEY:
+    if not AUTH_KEY:
+        return True
+    if handler.headers.get("Authorization", "") == "Bearer " + AUTH_KEY:
+        return True
+    # Anthropic 客户端（Claude Code 的 ANTHROPIC_API_KEY 模式）走 x-api-key 头
+    if handler.headers.get("x-api-key", "") == AUTH_KEY:
         return True
     handler._json(401, {"error": {"message": "unauthorized"}})
     return False
@@ -122,6 +127,47 @@ MODEL_ALIAS = {
     "hy4-flash": "hy4flash-free",
     "hy4flash-dev": "hy4flash-free",
 }
+
+# 模型路由：客户端协议的档位名 → 上游模型。Claude Code / Codex 等客户端发来的是
+# 自己的默认模型名（claude-opus-* / claude-sonnet-* / claude-haiku-* 或档位词），
+# 网关侧改写到上游模型，客户端零配置。精确键优先，其次按档位子串匹配。
+# 可用环境变量 WB_MODEL_ROUTES（JSON 对象）覆盖/增补，例如 {"opus":"hy4free"}。
+_DEFAULT_MODEL_ROUTES = {
+    "opus": "glm-5.3-flash",
+    "sonnet": "glm-5.3-flash",
+    "haiku": "deepseek-v4.1-flash",
+}
+
+
+def _load_model_routes():
+    routes = dict(_DEFAULT_MODEL_ROUTES)
+    raw = os.environ.get("WB_MODEL_ROUTES", "")
+    if raw:
+        try:
+            extra = json.loads(raw)
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        routes[k.strip().lower()] = v.strip()
+        except Exception:
+            pass
+    return routes
+
+
+MODEL_ROUTES = _load_model_routes()
+
+
+def route_model(model_l):
+    """把客户端模型名路由到上游模型名；无规则命中返回 None（保持原名）。"""
+    if not model_l:
+        return None
+    if model_l in MODEL_ROUTES:
+        return MODEL_ROUTES[model_l]
+    for tier in ("opus", "sonnet", "haiku"):
+        if tier in model_l and tier in MODEL_ROUTES:
+            return MODEL_ROUTES[tier]
+    return None
+
 
 # 额度耗尽的错误特征
 EXHAUST_HTTP_CODES = {402, 429}
@@ -609,6 +655,498 @@ def aggregate_stream(resp):
     }
 
 
+# ----------------------------------------------------------------------------
+# A 包：协议翻译层（Anthropic Messages / OpenAI Responses ↔ Chat Completions）
+# 上游只有 Chat 形态 SSE；两个新协议在网关侧做请求/响应翻译，选号、轮换、
+# 耗尽判定、记账全部复用 _handle 主链。翻译函数均为纯函数，可离线单测。
+# ----------------------------------------------------------------------------
+import uuid as _uuid
+
+
+def _clean_id(raw, prefix):
+    s = "".join(c for c in str(raw or "") if c.isalnum() or c in "-_")
+    return prefix + (s or _uuid.uuid4().hex[:16])
+
+
+def _anthropic_stop(finish):
+    return {"stop": "end_turn", "tool_calls": "tool_use",
+            "length": "max_tokens", "content_filter": "refusal"}.get(finish, "end_turn")
+
+
+def _anthropic_text(content):
+    """Anthropic content（str | block 列表）→ 纯文本（tool_result 等场景用）"""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for b in content or []:
+        if isinstance(b, dict) and b.get("type") == "text":
+            parts.append(b.get("text") or "")
+    return "".join(parts)
+
+
+def _anthropic_image_part(block):
+    src = block.get("source") or {}
+    if src.get("type") == "base64":
+        url = "data:%s;base64,%s" % (src.get("media_type") or "image/png",
+                                     src.get("data") or "")
+    else:
+        url = src.get("url") or ""
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def anthropic_to_chat(body):
+    """Anthropic Messages 请求 → Chat Completions 请求（纯函数）"""
+    msgs = []
+    system = body.get("system")
+    if system:
+        text = _anthropic_text(system)
+        if text:
+            msgs.append({"role": "system", "content": text})
+    for m in body.get("messages") or []:
+        role = m.get("role") or "user"
+        content = m.get("content")
+        if isinstance(content, str):
+            msgs.append({"role": role, "content": content})
+            continue
+        text_parts, image_parts, tool_calls = [], [], []
+        for b in content or []:
+            if not isinstance(b, dict):
+                continue
+            t = b.get("type")
+            if t == "text":
+                text_parts.append(b.get("text") or "")
+            elif t == "image":
+                image_parts.append(_anthropic_image_part(b))
+            elif t == "tool_use":
+                tool_calls.append({
+                    "id": b.get("id") or "", "type": "function",
+                    "function": {"name": b.get("name") or "",
+                                 "arguments": json.dumps(b.get("input") or {},
+                                                         ensure_ascii=False)}})
+            elif t == "tool_result":
+                msgs.append({"role": "tool",
+                             "tool_call_id": b.get("tool_use_id") or "",
+                             "content": _anthropic_text(b.get("content"))})
+            # thinking / redacted_thinking：回放无意义，丢弃
+        if role == "assistant" and tool_calls:
+            msgs.append({"role": "assistant", "content": "".join(text_parts),
+                         "tool_calls": tool_calls})
+        elif image_parts:
+            parts = [{"type": "text", "text": tp} for tp in text_parts if tp]
+            msgs.append({"role": role, "content": parts + image_parts})
+        elif text_parts or role != "assistant" or not tool_calls:
+            if text_parts or not tool_calls:
+                msgs.append({"role": role, "content": "".join(text_parts)})
+    out = {"model": body.get("model") or "", "messages": msgs}
+    for k in ("max_tokens", "temperature", "top_p", "top_k"):
+        if body.get(k) is not None:
+            out[k] = body[k]
+    if body.get("stop_sequences"):
+        out["stop"] = body["stop_sequences"]
+    tools = []
+    for t in body.get("tools") or []:
+        if isinstance(t, dict) and t.get("name"):
+            tools.append({"type": "function", "function": {
+                "name": t["name"], "description": t.get("description") or "",
+                "parameters": t.get("input_schema") or {"type": "object"}}})
+    if tools:
+        out["tools"] = tools
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict):
+        ttype = tc.get("type")
+        if ttype == "auto":
+            out["tool_choice"] = "auto"
+        elif ttype == "any":
+            out["tool_choice"] = "required"
+        elif ttype == "none":
+            out["tool_choice"] = "none"
+        elif ttype == "tool" and tc.get("name"):
+            out["tool_choice"] = {"type": "function",
+                                  "function": {"name": tc["name"]}}
+    return out
+
+
+def chat_to_anthropic(result, model):
+    """聚合后的 Chat 响应 → Anthropic Message（纯函数）"""
+    choice = (result.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    content = []
+    if msg.get("reasoning_content"):
+        content.append({"type": "thinking", "thinking": msg["reasoning_content"]})
+    if msg.get("content"):
+        content.append({"type": "text", "text": msg["content"]})
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        try:
+            inp = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            inp = {}
+        if not isinstance(inp, dict):
+            inp = {"value": inp}
+        content.append({"type": "tool_use", "id": tc.get("id") or "",
+                        "name": fn.get("name") or "", "input": inp})
+    if not content:
+        content = [{"type": "text", "text": ""}]
+    usage = result.get("usage") or {}
+    return {
+        "id": _clean_id(result.get("id"), "msg_"),
+        "type": "message", "role": "assistant",
+        "model": result.get("model") or model,
+        "content": content,
+        "stop_reason": _anthropic_stop(choice.get("finish_reason")),
+        "stop_sequence": None,
+        "usage": {"input_tokens": usage.get("prompt_tokens") or 0,
+                  "output_tokens": usage.get("completion_tokens") or 0},
+    }
+
+
+def responses_to_chat(body):
+    """OpenAI Responses 请求 → Chat Completions 请求（纯函数）"""
+    msgs = []
+    if body.get("instructions"):
+        msgs.append({"role": "system", "content": str(body["instructions"])})
+    inp = body.get("input")
+    if isinstance(inp, str):
+        msgs.append({"role": "user", "content": inp})
+    pending_calls = []
+
+    def flush_calls():
+        if pending_calls:
+            msgs.append({"role": "assistant", "content": "",
+                         "tool_calls": list(pending_calls)})
+            del pending_calls[:]
+
+    for item in inp or []:
+        if not isinstance(item, dict):
+            continue
+        t = item.get("type")
+        if t == "function_call":
+            pending_calls.append({
+                "id": item.get("call_id") or item.get("id") or "",
+                "type": "function",
+                "function": {"name": item.get("name") or "",
+                             "arguments": item.get("arguments") or "{}"}})
+            continue
+        flush_calls()
+        if t == "function_call_output":
+            out = item.get("output")
+            msgs.append({"role": "tool",
+                         "tool_call_id": item.get("call_id") or "",
+                         "content": out if isinstance(out, str)
+                         else json.dumps(out or "", ensure_ascii=False)})
+        elif t == "message" or (t is None and item.get("role")):
+            role = item.get("role") or "user"
+            c = item.get("content")
+            if isinstance(c, str):
+                msgs.append({"role": role, "content": c})
+                continue
+            parts = []
+            for p in c or []:
+                if not isinstance(p, dict):
+                    continue
+                pt = p.get("type")
+                if pt in ("input_text", "output_text", "text"):
+                    parts.append({"type": "text", "text": p.get("text") or ""})
+                elif pt == "input_image":
+                    parts.append({"type": "image_url",
+                                  "image_url": {"url": p.get("image_url") or ""}})
+            texts = [p["text"] for p in parts if p["type"] == "text"]
+            if len(parts) == len(texts):
+                msgs.append({"role": role, "content": "".join(texts)})
+            else:
+                msgs.append({"role": role, "content": parts})
+        # reasoning 等其余条目：回放无意义，跳过
+    flush_calls()
+    out = {"model": body.get("model") or "", "messages": msgs}
+    if body.get("max_output_tokens") is not None:
+        out["max_tokens"] = body["max_output_tokens"]
+    for k in ("temperature", "top_p"):
+        if body.get(k) is not None:
+            out[k] = body[k]
+    tools = []
+    for t in body.get("tools") or []:
+        if isinstance(t, dict) and t.get("type") == "function" and t.get("name"):
+            tools.append({"type": "function", "function": {
+                "name": t["name"], "description": t.get("description") or "",
+                "parameters": t.get("parameters") or {"type": "object"}}})
+    if tools:
+        out["tools"] = tools
+    tc = body.get("tool_choice")
+    if isinstance(tc, str):
+        out["tool_choice"] = tc
+    elif isinstance(tc, dict) and tc.get("type") == "function" and tc.get("name"):
+        out["tool_choice"] = {"type": "function", "function": {"name": tc["name"]}}
+    return out
+
+
+def _responses_output_items(msg):
+    items = []
+    text = msg.get("content") or ""
+    if text or not msg.get("tool_calls"):
+        items.append({
+            "id": _clean_id("", "msg_"), "type": "message", "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}]})
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        items.append({
+            "id": _clean_id("", "fc_"), "type": "function_call",
+            "status": "completed", "call_id": tc.get("id") or "",
+            "name": fn.get("name") or "", "arguments": fn.get("arguments") or ""})
+    return items
+
+
+def _responses_object(rid, model, status, output, usage):
+    u = usage or {}
+    return {
+        "id": rid, "object": "response", "created_at": int(time.time()),
+        "status": status, "model": model, "output": output,
+        "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
+        "usage": {"input_tokens": u.get("prompt_tokens") or 0,
+                  "output_tokens": u.get("completion_tokens") or 0,
+                  "total_tokens": u.get("total_tokens")
+                  or ((u.get("prompt_tokens") or 0)
+                      + (u.get("completion_tokens") or 0))},
+    }
+
+
+def chat_to_responses(result, model):
+    """聚合后的 Chat 响应 → Responses 响应对象（纯函数）"""
+    choice = (result.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    return _responses_object(_clean_id(result.get("id"), "resp_"),
+                             result.get("model") or model, "completed",
+                             _responses_output_items(msg), result.get("usage"))
+
+
+def _iter_upstream_chunks(resp):
+    """迭代上游 SSE，逐个产出已解析的 chunk dict"""
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            yield json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+
+def anthropic_sse(resp, model, sink):
+    """上游 Chat SSE → Anthropic Messages SSE（生成器，产出 bytes）。
+
+    sink 回填 {"usage":..., "finish":...} 供记账。块按首次出现顺序开/关：
+    thinking → text → tool_use 依次独占，切换类型时先关旧块。
+    """
+    def ev(event, obj):
+        return ("event: %s\ndata: %s\n\n"
+                % (event, json.dumps(obj, ensure_ascii=False))).encode("utf-8")
+
+    usage, finish, started = {}, None, False
+    open_kind, block_index = None, -1
+    tool_meta = {}
+
+    def close_block():
+        nonlocal open_kind
+        if open_kind is None:
+            return []
+        open_kind = None
+        return [ev("content_block_stop",
+                   {"type": "content_block_stop", "index": block_index})]
+
+    for chunk in _iter_upstream_chunks(resp):
+        if not started:
+            started = True
+            yield ev("message_start", {"type": "message_start", "message": {
+                "id": _clean_id(chunk.get("id"), "msg_"), "type": "message",
+                "role": "assistant", "model": chunk.get("model") or model,
+                "content": [], "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0}}})
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        for ch in chunk.get("choices") or []:
+            delta = ch.get("delta") or {}
+            if ch.get("finish_reason"):
+                finish = ch["finish_reason"]
+            rc = delta.get("reasoning_content")
+            if rc:
+                if open_kind != "thinking":
+                    yield from close_block()
+                    block_index += 1
+                    open_kind = "thinking"
+                    yield ev("content_block_start", {
+                        "type": "content_block_start", "index": block_index,
+                        "content_block": {"type": "thinking", "thinking": ""}})
+                yield ev("content_block_delta", {
+                    "type": "content_block_delta", "index": block_index,
+                    "delta": {"type": "thinking_delta", "thinking": rc}})
+            if delta.get("content"):
+                if open_kind != "text":
+                    yield from close_block()
+                    block_index += 1
+                    open_kind = "text"
+                    yield ev("content_block_start", {
+                        "type": "content_block_start", "index": block_index,
+                        "content_block": {"type": "text", "text": ""}})
+                yield ev("content_block_delta", {
+                    "type": "content_block_delta", "index": block_index,
+                    "delta": {"type": "text_delta", "text": delta["content"]}})
+            for tc in delta.get("tool_calls") or []:
+                ti = tc.get("index", 0)
+                meta = tool_meta.setdefault(ti, {"id": "", "name": ""})
+                if tc.get("id"):
+                    meta["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    meta["name"] += fn["name"]
+                if open_kind != ("tool", ti):
+                    yield from close_block()
+                    block_index += 1
+                    open_kind = ("tool", ti)
+                    yield ev("content_block_start", {
+                        "type": "content_block_start", "index": block_index,
+                        "content_block": {"type": "tool_use",
+                                          "id": meta["id"] or ("toolu_%d" % ti),
+                                          "name": meta["name"], "input": {}}})
+                if fn.get("arguments"):
+                    yield ev("content_block_delta", {
+                        "type": "content_block_delta", "index": block_index,
+                        "delta": {"type": "input_json_delta",
+                                  "partial_json": fn["arguments"]}})
+    if not started:
+        yield ev("message_start", {"type": "message_start", "message": {
+            "id": _clean_id("", "msg_"), "type": "message", "role": "assistant",
+            "model": model, "content": [], "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0}}})
+    yield from close_block()
+    sink["usage"] = usage
+    sink["finish"] = finish
+    yield ev("message_delta", {"type": "message_delta", "delta": {
+        "stop_reason": _anthropic_stop(finish), "stop_sequence": None},
+        "usage": {"input_tokens": usage.get("prompt_tokens") or 0,
+                  "output_tokens": usage.get("completion_tokens") or 0}})
+    yield ev("message_stop", {"type": "message_stop"})
+
+
+def responses_sse(resp, model, sink):
+    """上游 Chat SSE → OpenAI Responses SSE（生成器，产出 bytes）"""
+    seq = [0]
+
+    def ev(event, obj):
+        payload = {"type": event, "sequence_number": seq[0]}
+        payload.update(obj)
+        seq[0] += 1
+        return ("event: %s\ndata: %s\n\n"
+                % (event, json.dumps(payload, ensure_ascii=False))).encode("utf-8")
+
+    rid = _clean_id("", "resp_")
+    usage, finish = {}, None
+    yield ev("response.created", {"response": _responses_object(
+        rid, model, "in_progress", [], None)})
+    yield ev("response.in_progress", {"response": _responses_object(
+        rid, model, "in_progress", [], None)})
+
+    out_index = -1
+    text_item = None          # {"id", "parts_text"}
+    tool_items = {}           # tool index -> {"id","call_id","name","args","out_index"}
+
+    def close_text_item():
+        nonlocal text_item
+        if text_item is None:
+            return []
+        item = {"id": text_item["id"], "type": "message", "status": "completed",
+                "role": "assistant", "content": [
+                    {"type": "output_text", "text": text_item["text"],
+                     "annotations": []}]}
+        out = [ev("response.output_text.done", {
+                    "item_id": text_item["id"], "output_index": text_item["out_index"],
+                    "content_index": 0, "text": text_item["text"]}),
+               ev("response.content_part.done", {
+                    "item_id": text_item["id"], "output_index": text_item["out_index"],
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": text_item["text"],
+                             "annotations": []}}),
+               ev("response.output_item.done", {
+                    "output_index": text_item["out_index"], "item": item})]
+        text_item["final"] = item
+        return out
+
+    for chunk in _iter_upstream_chunks(resp):
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        for ch in chunk.get("choices") or []:
+            delta = ch.get("delta") or {}
+            if ch.get("finish_reason"):
+                finish = ch["finish_reason"]
+            if delta.get("content"):
+                if text_item is None:
+                    out_index += 1
+                    text_item = {"id": _clean_id("", "msg_"), "text": "",
+                                 "out_index": out_index}
+                    yield ev("response.output_item.added", {
+                        "output_index": out_index, "item": {
+                            "id": text_item["id"], "type": "message",
+                            "status": "in_progress", "role": "assistant",
+                            "content": []}})
+                    yield ev("response.content_part.added", {
+                        "item_id": text_item["id"], "output_index": out_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": "",
+                                 "annotations": []}})
+                text_item["text"] += delta["content"]
+                yield ev("response.output_text.delta", {
+                    "item_id": text_item["id"], "output_index": text_item["out_index"],
+                    "content_index": 0, "delta": delta["content"]})
+            for tc in delta.get("tool_calls") or []:
+                ti = tc.get("index", 0)
+                fn = tc.get("function") or {}
+                slot = tool_items.get(ti)
+                if slot is None:
+                    out_index += 1
+                    slot = {"id": _clean_id("", "fc_"),
+                            "call_id": tc.get("id") or "",
+                            "name": fn.get("name") or "", "args": "",
+                            "out_index": out_index}
+                    tool_items[ti] = slot
+                    yield ev("response.output_item.added", {
+                        "output_index": out_index, "item": {
+                            "id": slot["id"], "type": "function_call",
+                            "status": "in_progress", "call_id": slot["call_id"],
+                            "name": slot["name"], "arguments": ""}})
+                if tc.get("id"):
+                    slot["call_id"] = tc["id"]
+                if fn.get("name"):
+                    slot["name"] += fn["name"]
+                if fn.get("arguments"):
+                    slot["args"] += fn["arguments"]
+                    yield ev("response.function_call_arguments.delta", {
+                        "item_id": slot["id"], "output_index": slot["out_index"],
+                        "delta": fn["arguments"]})
+    final_items = []
+    if text_item is not None:
+        yield from close_text_item()
+        final_items.append((text_item["out_index"], text_item["final"]))
+    for ti in sorted(tool_items):
+        slot = tool_items[ti]
+        item = {"id": slot["id"], "type": "function_call", "status": "completed",
+                "call_id": slot["call_id"], "name": slot["name"],
+                "arguments": slot["args"]}
+        yield ev("response.function_call_arguments.done", {
+            "item_id": slot["id"], "output_index": slot["out_index"],
+            "arguments": slot["args"]})
+        yield ev("response.output_item.done", {
+            "output_index": slot["out_index"], "item": item})
+        final_items.append((slot["out_index"], item))
+    final_items = [it for _i, it in sorted(final_items)]
+    sink["usage"] = usage
+    sink["finish"] = finish
+    yield ev("response.completed", {"response": _responses_object(
+        rid, model, "completed", final_items, usage)})
+
+
 # P1 请求记账：JSONL 一调用一行，保留 30 天（借鉴 workbuddy2api 系列的审计日志）
 LOG_DIR = os.path.join(HERE, "logs")
 USAGE_RETENTION_DAYS = 30
@@ -695,7 +1233,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("[%s] %s\n" % (datetime.now().strftime("%H:%M:%S"), fmt % args))
 
-    def _json(self, code, obj):
+    def _json(self, code, obj, log_obj=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -703,14 +1241,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
         # P1 记账：所有 JSON 响应统一在此落账（流式成功在 _stream_response 落账）
+        # log_obj：翻译端点的响应体形状已变（usage 键名不同），记账仍按
+        # Chat 形态的原始聚合结果读 usage，传入 log_obj 时以它为准。
+        src = log_obj if log_obj is not None else obj
         ctx = getattr(self, "_ctx", None)
         if ctx:
             err = ""
-            if isinstance(obj, dict) and isinstance(obj.get("error"), dict):
-                err = str(obj["error"].get("message") or "")
+            if isinstance(src, dict) and isinstance(src.get("error"), dict):
+                err = str(src["error"].get("message") or "")
             # 非流式响应由 aggregate_stream 聚合，usage 已随响应体返回，这里一并落账。
             # 此前未取 usage，导致 stream=false 的调用 token 恒为 null，用量统计偏低。
-            u = obj.get("usage") if isinstance(obj, dict) else None
+            u = src.get("usage") if isinstance(src, dict) else None
             u = u if isinstance(u, dict) else {}
             log_request(ctx.get("account"), ctx.get("model"), code,
                         (time.time() - ctx["t0"]) * 1000,
@@ -772,6 +1313,44 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 客户端请求体里的 stream 字段在转发前被覆盖，这里还原客户端原始意图
         return getattr(self, "_client_stream", False)
 
+    def _err(self, code, message, etype=None):
+        """按当前端点协议形状回错误（A 包）：chat/responses 用 OpenAI 形态，
+        messages 用 Anthropic 形态 {type:error,error:{type,message}}。"""
+        if getattr(self, "_fmt", "chat") == "messages":
+            self._json(code, {"type": "error", "error": {
+                "type": etype or "api_error", "message": message}})
+        else:
+            obj = {"error": {"message": message}}
+            if etype:
+                obj["error"]["type"] = etype
+            self._json(code, obj)
+
+    def _stream_response_translated(self, resp, fmt):
+        """翻译端点的流式回写：边翻译边下发，结束时按上游 usage 落账。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        account = (getattr(self, "_ctx", None) or {}).get("account") or ""
+        self.send_header("X-Rotator-Account", urllib.parse.quote(account))
+        self.end_headers()
+        sink = {}
+        gen = (anthropic_sse if fmt == "messages" else responses_sse)(
+            resp, (self._ctx or {}).get("model") or "", sink)
+        try:
+            for data in gen:
+                self.wfile.write(data)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            ctx = getattr(self, "_ctx", None)
+            if ctx:
+                u = sink.get("usage") or {}
+                log_request(ctx.get("account"), ctx.get("model"), 200,
+                            (time.time() - ctx["t0"]) * 1000,
+                            t_in=u.get("prompt_tokens"),
+                            t_out=u.get("completion_tokens"))
+
     def _stream_response(self, resp):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -817,6 +1396,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 def do_POST_wrapper(self):
     if not _require_auth(self):
         return
+    self._path = (self.path or "").split("?")[0]
     try:
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b"{}"
@@ -830,6 +1410,14 @@ def do_POST_wrapper(self):
     _patched(self)
 
 
+# POST 路由（A 包）：三种协议入口，翻译后统一进 _handle 主链
+_POST_ROUTES = {
+    "/v1/chat/completions": "chat",
+    "/v1/messages": "messages",
+    "/v1/responses": "responses",
+}
+
+
 def _patched(self):
     """用缓存的请求体重走主逻辑（避免 rfile 已被消费）"""
     try:
@@ -837,6 +1425,15 @@ def _patched(self):
     except Exception:
         self._json(400, {"error": {"message": "invalid JSON body"}})
         return
+    fmt = _POST_ROUTES.get(getattr(self, "_path", "/v1/chat/completions"))
+    if fmt is None:
+        self._json(404, {"error": {"message": "not found"}})
+        return
+    self._fmt = fmt
+    if fmt == "messages":
+        req_body = anthropic_to_chat(req_body)
+    elif fmt == "responses":
+        req_body = responses_to_chat(req_body)
     ProxyHandler._handle(self, req_body)
 
 
@@ -844,14 +1441,19 @@ def _handle(self, req_body):
     _sync_sessions()   # 面板新授权/删除账号后立即生效，不必重启容器
     model = (req_body.get("model") or "").strip()
     model_l = model.lower()
+    # A 包模型路由：Claude/Codex 档位名先改写到上游模型，再走别名归一。
+    routed = route_model(model_l)
+    if routed:
+        model_l = routed.lower()
     # 先归一别名：白名单判定必须在归一之后，否则 hy4-free-trial-202611 这类
     # 带连字符的别名会在归一前就被 400 拒掉，别名表形同虚设。
     model_norm = MODEL_ALIAS.get(model_l, model_l)
     # P1 记账上下文：本次请求的模型与计时起点
     self._ctx = {"model": model_norm, "t0": time.time(), "account": None}
     if MODEL_WHITELIST and model_norm not in MODEL_WHITELIST:
-        self._json(400, {"error": {"message":
-            "model '%s' 不在白名单（仅支持: %s）" % (model, ", ".join(sorted(MODEL_WHITELIST)))}})
+        self._err(400, "model '%s' 不在白名单（仅支持: %s）"
+                  % (model, ", ".join(sorted(MODEL_WHITELIST))),
+                  "invalid_request_error")
         return
     # 标准化为官方模型 ID（官方大小写敏感）
     req_body["model"] = model_norm
@@ -863,10 +1465,9 @@ def _handle(self, req_body):
     for _ in range(MAX_SWITCH_RETRY):
         session = pick_available_session(self.sessions, self._ctx["model"], exclude=tried)
         if session is None:
-            self._json(503, {"error": {
-                "type": "all_accounts_exhausted",
-                "message": "所有账号今日额度已耗尽（已尝试: %s）。明日自动恢复，或执行 reset。" %
-                           (", ".join(tried) or "无可用账号")}})
+            self._err(503, "所有账号今日额度已耗尽（已尝试: %s）。明日自动恢复，或执行 reset。"
+                      % (", ".join(tried) or "无可用账号"),
+                      "all_accounts_exhausted")
             return
         tried.append(session.name)
         self._ctx["account"] = session.name
@@ -916,7 +1517,7 @@ def _handle(self, req_body):
                                      % (session.name, self._ctx["model"], credits))
                     continue
                 sys.stderr.write("⚠️ %s 返回 %s 但余额查询失败，保守返回错误\n" % (session.name, e.code))
-            self._json(e.code, {"error": {"message": err_text[:500] or ("HTTP %s" % e.code)}})
+            self._err(e.code, err_text[:500] or ("HTTP %s" % e.code))
             return
         except Exception as e:
             # 网络层瞬断（如大请求体 TLS EOF）：未向客户端输出任何内容，安全重试下一账号
@@ -924,23 +1525,34 @@ def _handle(self, req_body):
             self._last_net_err = str(e)[:200]
             continue
 
+        fmt = getattr(self, "_fmt", "chat")
         if want_stream:
-            self._stream_response(resp)
+            if fmt == "chat":
+                self._stream_response(resp)
+            else:
+                self._stream_response_translated(resp, fmt)
         else:
             try:
                 result = aggregate_stream(resp)
             except Exception as e:
-                self._json(502, {"error": {"message": "读取上游响应失败: %s" % str(e)[:150]}})
+                self._err(502, "读取上游响应失败: %s" % str(e)[:150])
                 return
-            result["rotator"] = {"account": session.name}
-            self._json(200, result)
+            if fmt == "messages":
+                self._json(200, chat_to_anthropic(result, self._ctx["model"]),
+                           log_obj=result)
+            elif fmt == "responses":
+                self._json(200, chat_to_responses(result, self._ctx["model"]),
+                           log_obj=result)
+            else:
+                result["rotator"] = {"account": session.name}
+                self._json(200, result)
         return
 
-    self._json(503, {"error": {
-        "type": "switch_limit_reached",
-        "message": "连续切换 %d 个账号仍失败（已尝试: %s%s）" % (
-            MAX_SWITCH_RETRY, ", ".join(tried),
-            ("；最后网络错误: " + self._last_net_err) if getattr(self, "_last_net_err", None) else "")}})
+    self._err(503, "连续切换 %d 个账号仍失败（已尝试: %s%s）" % (
+        MAX_SWITCH_RETRY, ", ".join(tried),
+        ("；最后网络错误: " + self._last_net_err)
+        if getattr(self, "_last_net_err", None) else ""),
+        "switch_limit_reached")
 
 
 ProxyHandler._handle = _handle

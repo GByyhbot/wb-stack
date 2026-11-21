@@ -13,6 +13,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from . import db
 from . import gateway_sync
+from . import growth_client
 from . import workbuddy_client as wb
 
 log = logging.getLogger("wb-manager.scheduler")
@@ -63,6 +64,7 @@ def _checkin_one(acc, trigger_source):
     total_credits / streak_days / available_credits，供 API 层组装响应。
     """
     ok, msg, reward, new_rt, total, streak = wb.checkin(acc["token"], acc["user_id"])
+    growth = None
     now = time_str()
     db.add_checkin_log(acc["id"], ok, msg, reward)
     fields = {
@@ -91,6 +93,20 @@ def _checkin_one(acc, trigger_source):
                 fields["quota_total"] = avail
                 fields["quota_used"] = 0
             fields["quota_checked_at"] = now
+        # B 包：签到后顺手跑一轮成长中心（旅行礼物/任务/补登/连登兑换/盲盒）。
+        # 用最新一代令牌进场，其轮换结果继续并入 fields 一并回写+同步网关；
+        # 成长中心失败不影响签到结论，只单独落一条日志。
+        if (db.get_settings() or {}).get("growth_enabled", "1") != "0":
+            try:
+                growth = growth_client.run_growth(
+                    fields.get("token", acc["token"]), acc["user_id"])
+                if growth.get("new_rt") and growth["new_rt"] != fields.get("token", acc["token"]):
+                    fields["token"] = growth["new_rt"]
+                db.add_checkin_log(acc["id"], bool(growth.get("ok")),
+                                   "成长中心：" + (growth.get("report") or "")[:400],
+                                   str(growth.get("credits_gained") or ""))
+            except Exception:
+                log.exception("成长中心执行异常 %s", acc["name"])
     else:
         if "刷新失败" in msg or "认证" in msg:
             fields["status"] = "error"
@@ -100,7 +116,10 @@ def _checkin_one(acc, trigger_source):
         gateway_sync.sync_gateway_rt(acc["name"], fields["token"])
     log.info("[%s] 签到 %s -> %s %s", trigger_source, acc["name"], "OK" if ok else "FAIL", msg)
     return {"account": acc["name"], "ok": ok, "message": msg, "reward": reward,
-            "total_credits": total, "streak_days": streak, "available_credits": avail}
+            "total_credits": total, "streak_days": streak, "available_credits": avail,
+            "growth": ({"report": growth.get("report"),
+                        "credits_gained": growth.get("credits_gained")}
+                       if growth else None)}
 
 
 def notify_wecom(title, content):

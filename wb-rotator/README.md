@@ -51,6 +51,12 @@ curl http://127.0.0.1:8310/v1/chat/completions -H "Content-Type: application/jso
   -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"hi"}]}'
 ```
 
+三协议同池（2026-11-21 新增）：除 `/v1/chat/completions` 外，网关还在内部做协议翻译——
+Claude Code 把 `ANTHROPIC_BASE_URL` 指到网关、用 `/v1/messages`（鉴权可用 `x-api-key`）；
+Codex 走 `/v1/responses`。两者的档位模型名（opus/sonnet/haiku、claude-* 全名）由网关
+按模型路由改写到上游模型（默认 opus/sonnet→glm-5.3-flash、haiku→deepseek-v4.1-flash，
+可用环境变量 `WB_MODEL_ROUTES` JSON 覆盖），客户端零配置。
+
 Python（OpenAI SDK）：
 ```python
 from openai import OpenAI

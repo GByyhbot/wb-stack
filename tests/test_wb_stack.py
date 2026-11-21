@@ -332,3 +332,309 @@ def test_recommendation_deprioritizes_unhealthy(rec):
              ("抖号", "m1"): {"requests": 10, "tokens": 1, "failed": 8, "limited": 0}}
     out = rec.build_recommendation(accounts, usage, {}, window_days=7)
     assert out["models"][0]["primary"]["account"] == "稳号"
+
+
+# --------------------------------------------------------------------------
+# A 包：协议翻译层 + 模型路由（2026-11-21 完善批）
+# --------------------------------------------------------------------------
+def _sse_lines(chunks):
+    out = []
+    for c in chunks:
+        out.append(("data: " + json.dumps(c) + "\n").encode("utf-8"))
+    out.append(b"data: [DONE]\n")
+    return out
+
+
+def test_route_model_tiers(rot):
+    """A: Claude 档位名按路由表改写；普通模型名不改写"""
+    assert rot.route_model("claude-opus-4-5") == "glm-5.3-flash"
+    assert rot.route_model("claude-sonnet-4-5") == "glm-5.3-flash"
+    assert rot.route_model("claude-haiku-4-5") == "deepseek-v4.1-flash"
+    assert rot.route_model("opus") == "glm-5.3-flash"
+    assert rot.route_model("glm-5.3-flash") is None
+    assert rot.route_model("") is None
+
+
+def test_anthropic_to_chat_full(rot):
+    """A: Anthropic 请求翻译——system/图片/tool_use/tool_result/工具定义"""
+    body = {
+        "model": "claude-sonnet-4-5", "max_tokens": 1024,
+        "system": "你是助手",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "看图"},
+                {"type": "image", "source": {"type": "base64",
+                                              "media_type": "image/png",
+                                              "data": "AAAA"}}]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "我查一下"},
+                {"type": "tool_use", "id": "t1", "name": "search",
+                 "input": {"q": "x"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": [{"type": "text", "text": "结果"}]}]},
+        ],
+        "tools": [{"name": "search", "description": "搜",
+                   "input_schema": {"type": "object"}}],
+        "tool_choice": {"type": "any"},
+    }
+    out = rot.anthropic_to_chat(body)
+    assert out["messages"][0] == {"role": "system", "content": "你是助手"}
+    um = out["messages"][1]
+    assert um["content"][1]["image_url"]["url"] == "data:image/png;base64,AAAA"
+    am = out["messages"][2]
+    assert am["tool_calls"][0]["function"]["name"] == "search"
+    assert json.loads(am["tool_calls"][0]["function"]["arguments"]) == {"q": "x"}
+    tm = out["messages"][3]
+    assert tm["role"] == "tool" and tm["tool_call_id"] == "t1"
+    assert tm["content"] == "结果"
+    assert out["tools"][0]["function"]["parameters"] == {"type": "object"}
+    assert out["tool_choice"] == "required"
+    assert out["max_tokens"] == 1024
+
+
+def test_chat_to_anthropic(rot):
+    """A: Chat 聚合响应 → Anthropic Message（tool_use/stop_reason/usage 映射）"""
+    result = {"id": "abc", "model": "glm-5.3-flash",
+              "choices": [{"message": {
+                  "role": "assistant", "content": "答",
+                  "tool_calls": [{"id": "t1", "type": "function",
+                                  "function": {"name": "f",
+                                               "arguments": "{\"a\": 1}"}}]},
+                  "finish_reason": "tool_calls"}],
+              "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+    out = rot.chat_to_anthropic(result, "glm-5.3-flash")
+    assert out["type"] == "message" and out["id"] == "msg_abc"
+    assert out["content"][0] == {"type": "text", "text": "答"}
+    assert out["content"][1]["type"] == "tool_use"
+    assert out["content"][1]["input"] == {"a": 1}
+    assert out["stop_reason"] == "tool_use"
+    assert out["usage"] == {"input_tokens": 10, "output_tokens": 5}
+
+
+def test_responses_roundtrip(rot):
+    """A: Responses 请求翻译（instructions/函数调用对）与响应对象形状"""
+    body = {"model": "gpt-5-codex", "instructions": "系统",
+            "input": [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "function_call", "call_id": "c1", "name": "f",
+                 "arguments": "{\"x\": 2}"},
+                {"type": "function_call_output", "call_id": "c1",
+                 "output": "done"}],
+            "tools": [{"type": "function", "name": "f", "parameters": {}}],
+            "max_output_tokens": 99}
+    chat = rot.responses_to_chat(body)
+    assert chat["messages"][0]["role"] == "system"
+    assert chat["messages"][1] == {"role": "user", "content": "hi"}
+    assert chat["messages"][2]["tool_calls"][0]["id"] == "c1"
+    assert chat["messages"][3] == {"role": "tool", "tool_call_id": "c1",
+                                   "content": "done"}
+    assert chat["max_tokens"] == 99
+    result = {"id": "z9", "model": "glm-5.3-flash",
+              "choices": [{"message": {"role": "assistant", "content": "ok"},
+                           "finish_reason": "stop"}],
+              "usage": {"prompt_tokens": 3, "completion_tokens": 4,
+                        "total_tokens": 7}}
+    resp = rot.chat_to_responses(result, "glm-5.3-flash")
+    assert resp["object"] == "response" and resp["status"] == "completed"
+    assert resp["output"][0]["content"][0] == {
+        "type": "output_text", "text": "ok", "annotations": []}
+    assert resp["usage"]["total_tokens"] == 7
+
+
+def test_anthropic_sse_translation(rot):
+    """A: 流式翻译——reasoning/text/tool 三类块顺序开闭，收尾 stop_reason"""
+    chunks = [
+        {"id": "s1", "model": "glm-5.3-flash",
+         "choices": [{"delta": {"reasoning_content": "想"}}]},
+        {"choices": [{"delta": {"content": "答"}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "t1",
+             "function": {"name": "f", "arguments": "{\"a\":"}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": "1}"}}]},
+                      "finish_reason": "tool_calls"}]},
+        {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 9}},
+    ]
+    sink = {}
+    raw = b"".join(rot.anthropic_sse(_sse_lines(chunks), "glm-5.3-flash", sink))
+    text = raw.decode("utf-8")
+    events = [l[7:] for l in text.splitlines() if l.startswith("event: ")]
+    assert events == ["message_start", "content_block_start",
+                      "content_block_delta", "content_block_stop",
+                      "content_block_start", "content_block_delta",
+                      "content_block_stop", "content_block_start",
+                      "content_block_delta", "content_block_delta",
+                      "content_block_stop", "message_delta", "message_stop"]
+    assert '"partial_json": "{\\"a\\":"' in text
+    assert '"stop_reason": "tool_use"' in text
+    assert sink["usage"]["completion_tokens"] == 9
+
+
+def test_responses_sse_translation(rot):
+    """A: Responses 流式——文本增量与 completed 终态对象完整"""
+    chunks = [
+        {"id": "s2", "model": "glm-5.3-flash",
+         "choices": [{"delta": {"content": "你"}}]},
+        {"choices": [{"delta": {"content": "好"}, "finish_reason": "stop"}]},
+        {"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2}},
+    ]
+    sink = {}
+    raw = b"".join(rot.responses_sse(_sse_lines(chunks), "glm-5.3-flash", sink))
+    text = raw.decode("utf-8")
+    assert "response.created" in text and "response.completed" in text
+    assert '"delta": "你"' in text and '"delta": "好"' in text
+    done = [l[6:] for l in text.splitlines()
+            if l.startswith("data: ") and "response.completed" in l]
+    final = json.loads(done[0])["response"]
+    assert final["status"] == "completed"
+    assert final["output"][0]["content"][0]["text"] == "你好"
+    assert final["usage"]["total_tokens"] == 3
+
+
+# --------------------------------------------------------------------------
+# B 包：成长中心（2026-11-21 完善批）
+# --------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def grw(mgr):
+    import app.growth_client as gc
+    return gc
+
+
+def test_makeup_candidates_rules(grw):
+    """B: 补登候选——当月/今天前/上线后/score=0/未补登，最近断点优先"""
+    streak = {"data": {"launch_date": "2026-06-01",
+                       "streak": {"days": 5, "makeup_dates": ["2026-11-10"]},
+                       "makeup_cards": {"balance": 2}}}
+    heat = {"data": {"today": {"date": "2026-11-21"}, "cells": [
+        {"date": "2026-11-05", "score": 0},
+        {"date": "2026-11-08", "score": 0},
+        {"date": "2026-11-10", "score": 0},
+        {"date": "2026-11-12", "score": 3},
+        {"date": "2026-10-30", "score": 0},
+        {"date": "2026-11-21", "score": 0},
+    ]}}
+    assert grw._makeup_candidates(streak, heat) == ["2026-11-08", "2026-11-05"]
+
+
+class _FakeResp:
+    def __init__(self, status, obj):
+        self.status = status
+        self._b = json.dumps(obj).encode("utf-8")
+
+    def read(self):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_run_growth_full_flow(grw, monkeypatch):
+    """B: 全流程编排——领礼物→接单/领奖→连登兑换→抽奖→派出，积分汇总与契约形状"""
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        url = req.full_url
+        path = url.split("/v2/activity/growth", 1)[1]
+        body = json.loads(req.data) if req.data else None
+        calls.append((req.get_method(), path, body))
+        routes = {
+            ("GET", "/buddy/travel/status"): (200, {"code": 0, "data": {
+                "state": "arrived", "record_id": 9, "daily_limit_reached": False}}),
+            ("POST", "/buddy/travel/claim"): (200, {"code": 0, "data": {
+                "reward_credit": 50}}),
+            ("GET", "/tasks"): (200, {"code": 0, "data": {"tasks": [
+                {"task_code": "t_new", "title": "新任务", "locked": False,
+                 "accept_status": "not_accepted"},
+                {"task_code": "t_done", "title": "已完成", "locked": False,
+                 "accept_status": "completed", "reward_credit": 30}]}}),
+            ("POST", "/tasks/accept"): (200, {"code": 0, "data": {"results": [
+                {"task_code": "t_new", "status": "ok"}]}}),
+            ("POST", "/tasks/t_done/claim"): (200, {"code": 0, "data": {
+                "credit": 30, "energy": 1}}),
+            ("GET", "/streak"): (200, {"code": 0, "data": {
+                "makeup_cards": {"balance": 0},
+                "streak": {"days": 7, "makeup_dates": []},
+                "launch_date": "2026-06-01"}}),
+            ("GET", "/redeem/summary"): (200, {"code": 0, "data": {
+                "starter_status": "available", "advanced_status": "claimed",
+                "legendary_status": "locked"}}),
+            ("POST", "/redeem"): (200, {"code": 0, "data": {"credit_granted": 20}}),
+            ("GET", "/lottery/chances"): (200, {"code": 0, "data": {"balance": 1}}),
+            ("POST", "/lottery/draw"): (200, {"code": 0, "data": {
+                "prize_name": "谢谢参与"}}),
+            ("GET", "/buddy/quota"): (200, {"code": 0, "data": {
+                "affordable": 0, "max_open_count": 1}}),
+            ("GET", "/buddy/travel/config"): (200, {"code": 0, "data": {
+                "locations": [{"id": 3, "name": "海岛"}]}}),
+            ("POST", "/buddy/travel/depart"): (200, {"code": 0, "data": {
+                "location": {"name": "海岛", "duration_hours": 6}}}),
+            ("GET", "/energy"): (200, {"code": 0, "data": {"balance": 12}}),
+        }
+        status, obj = routes[(req.get_method(), path)]
+        return _FakeResp(status, obj)
+
+    monkeypatch.setattr(grw.wb, "refresh_access_token",
+                        lambda rt: (True, "AT", "RT2", "ok"))
+    monkeypatch.setattr(grw.urllib.request, "urlopen", fake_urlopen)
+    r = grw.run_growth("RT1", "uid-1")
+    assert r["ok"] and r["new_rt"] == "RT2"
+    assert r["credits_gained"] == 100          # 50 礼物 + 30 任务 + 20 连登
+    assert r["energy"] == 12 and r["streak_days"] == 7
+    for frag in ("领旅行礼物 +50", "领任务奖", "连登兑换", "开盲盒", "派 Buddy 去海岛"):
+        assert frag in r["report"], frag
+    accept = [c for c in calls if c[1] == "/tasks/accept"][0]
+    assert accept[2] == {"task_codes": ["t_new"]}     # 复数数组契约
+    draw = [c for c in calls if c[1] == "/lottery/draw"][0]
+    assert str(draw[2].get("client_token", "")).startswith("u-")
+    redeem = [c for c in calls if c[1] == "/redeem"][0]
+    assert redeem[2]["tier"] == "7d"                  # 档位标识契约
+
+
+def test_checkin_one_runs_growth_and_chains_rt(mgr, monkeypatch):
+    """B: 签到成功后跑成长中心；成长轮换的令牌并入回写且结果进返回值/日志"""
+    db, sch = mgr["db"], mgr["sch"]
+    aid = db.add_account("成长甲", "g@x.cn", "grt1", 1)
+    monkeypatch.setattr(sch.wb, "checkin",
+                        lambda tok, uid=None: (True, "签到成功", "10", "grt2", 100, 3))
+    monkeypatch.setattr(sch.wb, "query_available_credits",
+                        lambda tok: (True, 88.0, 200.0, 112.0, "ok", ""))
+    monkeypatch.setattr(sch.growth_client, "run_growth",
+                        lambda tok, uid=None: {
+                            "ok": True, "report": "领旅行礼物 +50 积分",
+                            "credits_gained": 50, "energy": 1,
+                            "streak_days": 3, "idle": False, "failures": 0,
+                            "auth_failed": False, "new_rt": "grt3"})
+    r = sch._checkin_one(db.get_account(aid), "test")
+    row = db.get_account(aid)
+    assert r["growth"]["credits_gained"] == 50
+    assert row["token"] == "grt3"          # 成长中心轮换的最新一代胜出
+    logs = db.recent_logs(limit=5, account_id=aid)
+    assert any("成长中心" in (l["message"] or "") for l in logs)
+
+
+def test_gateway_info_and_growth_setting(mgr):
+    """UI 包：网关信息接口（路由表+三协议端点）；growth_enabled 设置可落库"""
+    main, db = mgr["main"], mgr["db"]
+    info = main.api_gateway_info()
+    paths = {e["path"] for e in info["endpoints"]}
+    assert {"/v1/chat/completions", "/v1/messages", "/v1/responses"} <= paths
+    assert info["routes"]["opus"] == "glm-5.3-flash"
+    assert info["routes"]["haiku"] == "deepseek-v4.1-flash"
+    main.api_set_settings(main.SettingsIn(growth_enabled="0"))
+    assert db.get_settings()["growth_enabled"] == "0"
+    main.api_set_settings(main.SettingsIn(growth_enabled="1"))
+    assert db.get_settings()["growth_enabled"] == "1"
+
+
+def test_panel_ui_contract():
+    """UI 包：面板含成长开关/成长统计卡/网关路由卡的挂载点（防误删守卫）"""
+    html = open(os.path.join(ROOT, "wb-manager", "static", "index.html"),
+                encoding="utf-8").read()
+    for marker in ('id="s_growth"', 'id="st_growth"', 'id="gwRoutes"',
+                   "loadGatewayInfo()", "loadGrowthToday()", "growth_enabled"):
+        assert marker in html, marker

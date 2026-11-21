@@ -98,6 +98,7 @@ class SettingsIn(BaseModel):
     checkin_time: str | None = None      # "HH:MM"
     quota_min_percent: float | None = None
     switch_enabled: str | None = None    # "1" / "0"
+    growth_enabled: str | None = None    # "1" / "0"（B 包成长中心，签到后执行）
     # B6: 原 api_base 字段已移除——客户端各接口地址是硬编码的不同域名，
     # 这个设置从未被任何逻辑读取，留在 UI 里只会误导。
     wecom_webhook: str | None = None     # 企业微信群机器人 Webhook 地址（异常告警）
@@ -626,6 +627,45 @@ def api_checkin_all():
 @app.get("/api/logs")
 def api_logs(limit: int = Query(100, le=500), account_id: int | None = None):
     return {"logs": db.recent_logs(limit, account_id)}
+
+
+# 网关协议与模型路由（A 包）：与 wb-rotator 的 MODEL_ROUTES 同规则——
+# 默认档位表 + 环境变量 WB_MODEL_ROUTES(JSON) 覆盖。两进程在 deploy 里
+# 共享同一份环境变量；分开部署时以网关侧 env 为准，此处仅作面板展示。
+_DEFAULT_MODEL_ROUTES = {
+    "opus": "glm-5.3-flash",
+    "sonnet": "glm-5.3-flash",
+    "haiku": "deepseek-v4.1-flash",
+}
+
+
+@app.get("/api/gateway-info")
+def api_gateway_info():
+    routes = dict(_DEFAULT_MODEL_ROUTES)
+    raw = os.environ.get("WB_MODEL_ROUTES", "")
+    if raw:
+        try:
+            extra = json.loads(raw)
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        routes[k.strip().lower()] = v.strip()
+        except Exception:
+            pass
+    return {
+        "endpoints": [
+            {"path": "/v1/chat/completions", "name": "Chat Completions",
+             "clients": "OpenAI SDK / 通用客户端"},
+            {"path": "/v1/messages", "name": "Anthropic Messages",
+             "clients": "Claude Code"},
+            {"path": "/v1/responses", "name": "Responses",
+             "clients": "Codex"},
+            {"path": "/v1/models", "name": "模型列表",
+             "clients": "全部"},
+        ],
+        "routes": routes,
+        "models": ["glm-5.3-flash", "deepseek-v4.1-flash", "hy4free", "hy4flash-free"],
+    }
 
 
 @app.get("/api/settings")

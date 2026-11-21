@@ -69,7 +69,7 @@
   }
 
   /* ---- 统计卡 ---- */
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap: 12px; margin-bottom: 14px; }
   .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px;
           box-shadow: var(--shadow); position: relative; overflow: hidden; }
   .stat::after { content: ''; position: absolute; right: -20px; top: -20px; width: 80px; height: 80px;
@@ -101,7 +101,7 @@
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--panel2); color: var(--muted); }
   .badge.goal { background: rgba(91,140,255,.15); color: var(--accent); }
 
-  .acc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+  .acc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap: 12px; }
   .acc-card { background: var(--panel2); border: 1px solid var(--border); border-radius: 12px; padding: 14px;
               display: flex; flex-direction: column; gap: 10px; transition: border-color .2s, transform .15s; }
   .acc-card:hover { border-color: var(--accent); transform: translateY(-1px); }
@@ -192,7 +192,7 @@
   .concept { font-size: 12px; color: var(--muted); line-height: 1.8; }
   .concept b { color: var(--text); }
 
-  .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 12px; }
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(160px, 100%), 1fr)); gap: 10px; margin-bottom: 12px; }
   label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
   input, select { width: 100%; background: var(--panel2); border: 1px solid var(--border); color: var(--text);
                   padding: 8px 10px; border-radius: 8px; font-size: 13px; outline: none; }
@@ -210,8 +210,18 @@
   .oauth-status a { color: var(--accent); }
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
-  .table-scroll { max-height: 320px; overflow-y: auto; }
+  .table-scroll { max-height: 320px; overflow-y: auto; overflow-x: auto; }
   .table-scroll.tall { max-height: 460px; }
+  /* 滚动表格表头吸顶：长日志/长列表滚动时列名不丢失 */
+  .table-scroll thead th { position: sticky; top: 0; background: var(--panel); z-index: 2; }
+  .badge.growth { background: rgba(52,211,153,.15); color: var(--green); }
+  .log-msg { max-width: 460px; word-break: break-word; line-height: 1.5; }
+  button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px; }
+  @media (prefers-reduced-motion: reduce) {
+    .view.active { animation: none; }
+    * { transition: none !important; }
+  }
 </style>
 </head>
 <body>
@@ -249,6 +259,8 @@
             <div class="delta">所有账号实时余额之和</div></div>
           <div class="stat"><div class="label">🌅 今日签到</div><div class="value" id="st_checkin">-</div>
             <div class="delta" id="st_checkin_sub">-</div></div>
+          <div class="stat"><div class="label">🌱 今日成长中心</div><div class="value" id="st_growth">-</div>
+            <div class="delta">旅行礼物 · 任务 · 连登兑换 · 盲盒（随签到执行）</div></div>
           <div class="stat"><div class="label">📊 近 7 天代理请求</div><div class="value" id="st_requests">-</div>
             <div class="delta" id="st_requests_sub">-</div></div>
         </div>
@@ -402,14 +414,29 @@
                 <div><label>每日签到时间（随机抖动 ±30 分钟）</label><input id="s_checkin_time" placeholder="08:30"></div>
                 <div><label>余额告警阈值 (%)</label><input id="s_quota_min" type="number" placeholder="10"></div>
                 <div><label>自动切换</label><select id="s_switch"><option value="1">开启</option><option value="0">关闭</option></select></div>
+                <div><label>成长中心（签到后领旅行/任务/连登/盲盒）</label><select id="s_growth"><option value="1">开启</option><option value="0">关闭</option></select></div>
                 <div style="grid-column: span 2;"><label>企业微信机器人 Webhook（异常/到期告警，留空不通知）</label><input id="s_wecom" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"></div>
               </div>
               <button class="btn btn-primary" onclick="saveSettings()">保存设置</button>
             </div>
+
+            <div class="card">
+              <h3>🌐 网关协议与模型路由</h3>
+              <div class="concept" style="margin-bottom:10px">
+                网关（:8310）三协议同池：OpenAI 客户端走 <span class="code">/v1/chat/completions</span>；
+                <b>Claude Code</b> 走 <span class="code">/v1/messages</span>（<span class="code">ANTHROPIC_BASE_URL</span> 指到网关、密钥填网关密钥）；
+                <b>Codex</b> 走 <span class="code">/v1/responses</span>。客户端的档位模型名由网关按下表改写，上游模型零配置：
+              </div>
+              <table>
+                <thead><tr><th>客户端档位</th><th>上游模型</th></tr></thead>
+                <tbody id="gwRoutes"><tr><td colspan="2" class="muted">加载中…</td></tr></tbody>
+              </table>
+              <div class="muted" style="margin-top:8px">路由可用网关环境变量 <span class="code">WB_MODEL_ROUTES</span>（JSON）覆盖，如 <span class="code">{"opus":"hy4free"}</span>；上游模型：<span id="gwModels">-</span></div>
+            </div>
           </div>
 
           <div class="card">
-            <h3>📜 签到日志</h3>
+            <h3>📜 签到与成长日志</h3>
             <div class="table-scroll tall">
               <table>
                 <thead><tr><th>时间</th><th>账号</th><th>结果</th><th>详情</th><th>奖励</th></tr></thead>
@@ -810,10 +837,42 @@ async function loadLogs() {
   const d = await req('GET', '/api/logs?limit=50');
   const tb = document.getElementById('logTable');
   if (!d.logs.length) { tb.innerHTML = '<tr><td colspan="5" class="muted">暂无日志</td></tr>'; return; }
-  tb.innerHTML = d.logs.map(l => `
+  tb.innerHTML = d.logs.map(l => {
+    const isGrowth = (l.message || '').startsWith('成长中心：');
+    const kind = isGrowth ? '<span class="badge growth">🌱 成长</span> ' : '';
+    const msg = isGrowth ? (l.message || '').slice(5) : (l.message || '');
+    const shown = isGrowth ? msg.slice(0, 160) : msg.slice(0, 60);
+    return `
     <tr><td class="muted">${l.created_at}</td><td>${esc(l.account_name || l.account_id)}</td>
-    <td class="${l.ok ? 'log-ok' : 'log-fail'}">${l.ok ? '✔ 成功' : '✘ 失败'}</td>
-    <td class="muted">${esc((l.message || '').slice(0, 60))}</td><td>${esc(l.reward || '-')}</td></tr>`).join('');
+    <td class="${l.ok ? 'log-ok' : 'log-fail'}">${kind}${l.ok ? '✔ 成功' : '✘ 失败'}</td>
+    <td class="muted log-msg" title="${esc(msg)}">${esc(shown)}</td><td>${esc(l.reward || '-')}</td></tr>`;
+  }).join('');
+}
+async function loadGrowthToday() {
+  try {
+    const d = await req('GET', '/api/logs?limit=100');
+    const now = new Date();
+    const today = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0')
+                + '-' + String(now.getDate()).padStart(2, '0');
+    let sum = 0, seen = false;
+    for (const l of d.logs || []) {
+      if ((l.created_at || '').startsWith(today) && (l.message || '').startsWith('成长中心：')) {
+        seen = true; sum += parseFloat(l.reward) || 0;
+      }
+    }
+    document.getElementById('st_growth').innerHTML =
+      seen ? `+${sum}<small>积分</small>` : '0<small>积分</small>';
+  } catch (e) { /* 统计卡失败不阻塞面板 */ }
+}
+async function loadGatewayInfo() {
+  try {
+    const d = await req('GET', '/api/gateway-info');
+    const tb = document.getElementById('gwRoutes');
+    tb.innerHTML = Object.entries(d.routes || {}).map(([k, v]) =>
+      `<tr><td class="code">${esc(k)}</td><td class="code">${esc(v)}</td></tr>`).join('')
+      || '<tr><td colspan="2" class="muted">无路由</td></tr>';
+    document.getElementById('gwModels').textContent = (d.models || []).join(' · ');
+  } catch (e) { /* 网关信息失败不阻塞面板 */ }
 }
 async function loadSettings() {
   const d = await req('GET', '/api/settings');
@@ -821,6 +880,7 @@ async function loadSettings() {
   document.getElementById('s_checkin_time').value = s.checkin_time || '';
   document.getElementById('s_quota_min').value = s.quota_min_percent || '';
   document.getElementById('s_switch').value = s.switch_enabled || '1';
+  document.getElementById('s_growth').value = s.growth_enabled || '1';
   document.getElementById('s_wecom').value = s.wecom_webhook || '';
 }
 async function saveSettings() {
@@ -828,6 +888,7 @@ async function saveSettings() {
     checkin_time: document.getElementById('s_checkin_time').value.trim(),
     quota_min_percent: parseFloat(document.getElementById('s_quota_min').value) || 10,
     switch_enabled: document.getElementById('s_switch').value,
+    growth_enabled: document.getElementById('s_growth').value,
     wecom_webhook: document.getElementById('s_wecom').value.trim(),
   });
   toast('设置已保存');
@@ -953,8 +1014,10 @@ async function validateOne(id) {
 async function checkinAll() {
   const d = await req('POST', '/api/checkin/all');
   const okCount = d.results.filter(r => r.ok).length;
-  toast(`签到完成: ${okCount}/${d.results.length} 成功`, okCount === d.results.length);
-  loadAccounts(); loadLogs(); loadActive();
+  const gSum = d.results.reduce((s, r) => s + ((r.growth && r.growth.credits_gained) || 0), 0);
+  toast(`签到完成: ${okCount}/${d.results.length} 成功` + (gSum ? `，成长中心 +${gSum} 积分` : ''),
+        okCount === d.results.length);
+  loadAccounts(); loadLogs(); loadActive(); loadGrowthToday();
 }
 async function refreshAllQuota() {
   const d = await req('GET', '/api/accounts');
@@ -965,8 +1028,8 @@ async function refreshAllQuota() {
   toast('可用积分刷新完成'); loadAccounts(); loadActive();
 }
 
-loadAccounts(); loadActive(); loadLogs(); loadSettings(); loadUsage(); loadPin(); loadRecommendation();
-setInterval(() => { loadAccounts(); loadActive(); loadUsage(); loadRecommendation(); }, 60000);
+loadAccounts(); loadActive(); loadLogs(); loadSettings(); loadUsage(); loadPin(); loadRecommendation(); loadGatewayInfo(); loadGrowthToday();
+setInterval(() => { loadAccounts(); loadActive(); loadUsage(); loadRecommendation(); loadGrowthToday(); }, 60000);
 </script>
 </body>
 </html>
