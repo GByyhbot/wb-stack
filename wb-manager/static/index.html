@@ -6,36 +6,71 @@
 <title>WorkBuddy 多账号管理平台</title>
 <style>
   :root, [data-theme="dark"] {
-    --bg: #0d1017; --panel: #151926; --panel2: #1d2233; --border: #2a3046;
-    --text: #e7eaf3; --muted: #8a92a8; --accent: #5b8cff; --accent2: #7c5bff;
+    --bg: #0b0e14; --panel: #131722; --panel2: #1a1f2e; --border: #262d42;
+    --text: #e8ebf4; --muted: #8a92a8; --accent: #5b8cff; --accent2: #7c5bff;
     --green: #34d399; --red: #f87171; --yellow: #fbbf24;
-    --shadow: 0 2px 12px rgba(0,0,0,.35);
+    --shadow: 0 2px 14px rgba(0,0,0,.35);
   }
   [data-theme="light"] {
-    --bg: #f3f5fa; --panel: #ffffff; --panel2: #eef1f8; --border: #dde2ee;
+    --bg: #f2f4f9; --panel: #ffffff; --panel2: #edf0f7; --border: #dbe1ee;
     --text: #1c2130; --muted: #6b7286; --shadow: 0 2px 10px rgba(30,40,80,.08);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
          transition: background .25s, color .25s; }
-  .container { max-width: 1180px; margin: 0 auto; padding: 20px 16px 40px; }
+  button { font-family: inherit; }
 
-  /* ---- 顶栏 ---- */
-  .topbar { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
-  .logo { width: 38px; height: 38px; border-radius: 10px; flex: none;
+  /* ---- 整体布局：左侧导航 + 右侧内容 ---- */
+  .layout { display: flex; min-height: 100vh; }
+  .side { width: 224px; flex: none; position: sticky; top: 0; height: 100vh;
+          display: flex; flex-direction: column; gap: 4px; padding: 18px 14px;
+          background: var(--panel); border-right: 1px solid var(--border); z-index: 20; }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 2px 6px 14px; }
+  .logo { width: 38px; height: 38px; border-radius: 11px; flex: none;
           background: linear-gradient(135deg, var(--accent), var(--accent2));
           display: flex; align-items: center; justify-content: center; font-size: 20px;
           box-shadow: 0 4px 14px rgba(91,140,255,.35); }
-  h1 { font-size: 19px; }
-  .sub { color: var(--muted); font-size: 12px; }
-  .topbar .spacer { flex: 1; }
-  .icon-btn { border: 1px solid var(--border); background: var(--panel); color: var(--text);
-              width: 34px; height: 34px; border-radius: 9px; cursor: pointer; font-size: 15px; }
+  .brand h1 { font-size: 15px; line-height: 1.25; }
+  .brand .sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .nav { display: flex; flex-direction: column; gap: 4px; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px;
+              border: 1px solid transparent; background: transparent; color: var(--muted);
+              font-size: 13.5px; cursor: pointer; text-align: left; transition: all .15s; width: 100%; }
+  .nav-item:hover { color: var(--text); background: var(--panel2); }
+  .nav-item.active { color: var(--text); background: var(--panel2); border-color: var(--border);
+                     box-shadow: inset 3px 0 0 var(--accent); }
+  .nav-item .nav-badge { margin-left: auto; font-size: 11px; padding: 1px 8px; border-radius: 999px;
+                         background: rgba(248,113,113,.16); color: var(--red); display: none; }
+  .side .spacer { flex: 1; }
+  .side-foot { display: flex; align-items: center; gap: 8px; padding: 6px; color: var(--muted); font-size: 11px; }
+  .icon-btn { border: 1px solid var(--border); background: var(--panel2); color: var(--text);
+              width: 34px; height: 34px; border-radius: 9px; cursor: pointer; font-size: 15px; flex: none; }
   .icon-btn:hover { border-color: var(--accent); }
+  main { flex: 1; min-width: 0; padding: 22px 22px 48px; }
+  .page { max-width: 1220px; margin: 0 auto; }
+  .view { display: none; }
+  .view.active { display: block; animation: fadein .18s ease; }
+  @keyframes fadein { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+  .view-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  .view-head h2 { font-size: 17px; }
+  .view-head .right { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+
+  @media (max-width: 920px) {
+    .layout { flex-direction: column; }
+    .side { width: 100%; height: auto; position: sticky; top: 0; flex-direction: row; align-items: center;
+            padding: 10px 12px; border-right: none; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+    .brand { padding: 0 8px 0 0; }
+    .brand .sub { display: none; }
+    .nav { flex-direction: row; overflow-x: auto; flex: 1; }
+    .nav-item { width: auto; white-space: nowrap; padding: 8px 10px; }
+    .nav-item.active { box-shadow: inset 0 -3px 0 var(--accent); }
+    .side .spacer, .side-foot .ver { display: none; }
+    main { padding: 16px 12px 40px; }
+  }
 
   /* ---- 统计卡 ---- */
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 14px; }
-  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px;
           box-shadow: var(--shadow); position: relative; overflow: hidden; }
   .stat::after { content: ''; position: absolute; right: -20px; top: -20px; width: 80px; height: 80px;
                  border-radius: 50%; background: radial-gradient(circle, rgba(91,140,255,.10), transparent 70%); }
@@ -47,7 +82,7 @@
   .banner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
             background: linear-gradient(90deg, rgba(91,140,255,.22), rgba(91,140,255,.05) 55%, transparent);
             border: 1px solid var(--border); border-left: 4px solid var(--accent);
-            padding: 15px 18px; border-radius: 10px; margin-bottom: 16px; font-size: 13px; }
+            padding: 15px 18px; border-radius: 12px; margin-bottom: 14px; font-size: 13px; }
   .banner .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--green);
                  box-shadow: 0 0 0 4px rgba(52,211,153,.18); }
   .banner .lbl { color: var(--muted); letter-spacing: .3px; }
@@ -59,11 +94,12 @@
   .banner .warn { flex-basis: 100%; color: var(--yellow); font-size: 12px; }
 
   /* ---- 卡片与网格 ---- */
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
           padding: 16px; margin-bottom: 14px; box-shadow: var(--shadow); }
-  .card h2 { font-size: 14px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
-  .card h2 .right { margin-left: auto; display: flex; gap: 6px; }
+  .card h2, .card h3 { font-size: 14px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+  .card h2 .right, .card h3 .right { margin-left: auto; display: flex; gap: 6px; }
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--panel2); color: var(--muted); }
+  .badge.goal { background: rgba(91,140,255,.15); color: var(--accent); }
 
   .acc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
   .acc-card { background: var(--panel2); border: 1px solid var(--border); border-radius: 12px; padding: 14px;
@@ -88,21 +124,20 @@
   .quota-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 6px; transition: width .4s; }
   .quota-fill.warn { background: linear-gradient(90deg, #f59e0b, var(--yellow)); }
   .quota-fill.danger { background: linear-gradient(90deg, #ef4444, var(--red)); }
-  .acc-meta { display: flex; gap: 12px; color: var(--muted); font-size: 11px; }
+  .acc-meta { display: flex; gap: 12px; color: var(--muted); font-size: 11px; flex-wrap: wrap; }
   .acc-note { font-size: 12px; color: var(--muted); background: var(--panel); border: 1px dashed var(--border);
               border-radius: 7px; padding: 5px 9px; cursor: pointer; transition: border-color .15s, color .15s; }
   .acc-note:hover { border-color: var(--accent); color: var(--text); }
   .acc-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
   .btn { display: inline-block; border: 1px solid var(--border); background: var(--panel); color: var(--text);
-         padding: 5px 11px; border-radius: 7px; cursor: pointer; font-size: 12px; transition: all .15s; }
+         padding: 5px 11px; border-radius: 8px; cursor: pointer; font-size: 12px; transition: all .15s; }
   .btn:hover { border-color: var(--accent); color: var(--accent); }
   .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   .btn-primary:hover { color: #fff; opacity: .88; }
   .btn-danger { color: var(--red); }
 
   /* ---- 用量图表 ---- */
-  /* 数值贴柱顶显示（不靠 hover），柱下再补 token 总量，当天用量一眼可读 */
   .chart { display: flex; align-items: stretch; gap: 8px; height: 168px; padding: 16px 4px 0; }
   .chart .bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center;
                      justify-content: flex-end; gap: 5px; min-width: 0; }
@@ -124,12 +159,32 @@
           padding: 4px 10px; border-radius: 999px; color: var(--muted); }
   .chip b { color: var(--text); }
 
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th, td { padding: 7px 9px; text-align: left; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 500; font-size: 11px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { padding: 8px 9px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 11.5px; }
   tr:last-child td { border-bottom: none; }
   .log-ok { color: var(--green); } .log-fail { color: var(--red); }
-  .code { font-family: Consolas, monospace; font-size: 11px; }
+  .code { font-family: Consolas, monospace; font-size: 11.5px; }
+
+  /* ---- 用量推荐 ---- */
+  .risk-list { display: flex; flex-direction: column; gap: 7px; }
+  .risk { display: flex; gap: 8px; align-items: flex-start; font-size: 12.5px; line-height: 1.55;
+          background: rgba(251,191,36,.08); border: 1px solid rgba(251,191,36,.25);
+          border-radius: 9px; padding: 8px 11px; }
+  .risk.red { background: rgba(248,113,113,.08); border-color: rgba(248,113,113,.3); }
+  .rec-primary { font-weight: 700; font-size: 13px; }
+  .rec-reason { color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+  .sharebar { display: flex; height: 9px; border-radius: 5px; overflow: hidden; background: var(--panel2);
+              border: 1px solid var(--border); min-width: 130px; }
+  .sharebar > div { height: 100%; }
+  .share-legend { font-size: 11px; color: var(--muted); margin-top: 4px; line-height: 1.6; }
+  .share-legend b { color: var(--text); font-weight: 600; }
+  .days-badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--panel2); color: var(--muted); }
+  .days-badge.hot { background: rgba(248,113,113,.15); color: var(--red); }
+  .days-badge.warm { background: rgba(251,191,36,.14); color: var(--yellow); }
+  .summary-line { display: flex; gap: 8px; align-items: baseline; font-size: 13px; padding: 5px 0; flex-wrap: wrap; }
+  .summary-line .m { font-family: Consolas, monospace; font-size: 12px; color: var(--accent); }
+  .summary-line .arrow { color: var(--muted); }
 
   details { border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; background: var(--panel); }
   summary { cursor: pointer; font-size: 13px; color: var(--muted); }
@@ -140,8 +195,9 @@
   .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 12px; }
   label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
   input, select { width: 100%; background: var(--panel2); border: 1px solid var(--border); color: var(--text);
-                  padding: 8px 10px; border-radius: 7px; font-size: 13px; outline: none; }
+                  padding: 8px 10px; border-radius: 8px; font-size: 13px; outline: none; }
   input:focus, select:focus { border-color: var(--accent); }
+  td input[type="number"] { padding: 4px 6px; font-size: 12px; }
 
   .toast { position: fixed; top: 16px; right: 16px; background: var(--panel); border: 1px solid var(--accent);
            padding: 10px 16px; border-radius: 10px; font-size: 13px; display: none; z-index: 99; box-shadow: var(--shadow); }
@@ -154,143 +210,232 @@
   .oauth-status a { color: var(--accent); }
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+  .table-scroll { max-height: 320px; overflow-y: auto; }
+  .table-scroll.tall { max-height: 460px; }
 </style>
 </head>
 <body>
-<div class="container">
-  <div class="topbar">
-    <div class="logo">🤖</div>
-    <div>
-      <h1>WorkBuddy 多账号管理平台</h1>
-      <div class="sub">自动签到 · 积分监控 · 额度代理 · 主备切换</div>
+<div class="layout">
+  <aside class="side">
+    <div class="brand">
+      <div class="logo">🤖</div>
+      <div>
+        <h1>WorkBuddy<br>多账号管理</h1>
+        <div class="sub">签到 · 积分 · 轮换网关</div>
+      </div>
     </div>
+    <nav class="nav">
+      <button class="nav-item active" data-view="dashboard" onclick="showView('dashboard')">🏠 总览</button>
+      <button class="nav-item" data-view="recommend" onclick="showView('recommend')">🧭 用量推荐<span class="nav-badge" id="recRiskBadge"></span></button>
+      <button class="nav-item" data-view="usage" onclick="showView('usage')">📊 用量统计</button>
+      <button class="nav-item" data-view="manage" onclick="showView('manage')">⚙️ 账号与设置</button>
+    </nav>
     <div class="spacer"></div>
-    <button class="icon-btn" id="themeBtn" onclick="toggleTheme()" title="切换深浅色">🌙</button>
-  </div>
-
-  <div class="stats">
-    <div class="stat"><div class="label">👥 账号总数</div><div class="value" id="st_accounts">-</div>
-      <div class="delta" id="st_accounts_sub">-</div></div>
-    <div class="stat"><div class="label">💰 总可用积分</div><div class="value" id="st_credits">-</div>
-      <div class="delta">所有账号实时余额之和</div></div>
-    <div class="stat"><div class="label">🌅 今日签到</div><div class="value" id="st_checkin">-</div>
-      <div class="delta" id="st_checkin_sub">-</div></div>
-    <div class="stat"><div class="label">📊 近 7 天代理请求</div><div class="value" id="st_requests">-</div>
-      <div class="delta" id="st_requests_sub">-</div></div>
-  </div>
-
-  <div id="activeBanner" class="banner">加载中…</div>
-
-  <details open>
-    <summary>👥 账号管理（点开/收起）</summary>
-    <div class="concept" style="margin-bottom:12px">
-      📖 <b>积分</b>是账号维度的全局资源，是使用任何模型的前提——积分耗尽则所有模型均不可用；
-      <b>额度</b>是每个模型每日独立分配的用量，某模型当日额度用尽仅该模型不可用，其他模型不受影响。
-      两道闸门全部通过才能调用。本面板「可用积分」为积分层真实值。
+    <div class="side-foot">
+      <button class="icon-btn" id="themeBtn" onclick="toggleTheme()" title="切换深浅色">🌙</button>
+      <span class="ver">wb-manager</span>
     </div>
-    <div style="margin-bottom:12px">
-      <button class="btn btn-primary" onclick="checkinAll()">🌅 全部签到</button>
-      <button class="btn" onclick="refreshAllQuota()">💰 刷新全部余额</button>
-      <button class="btn" onclick="loadUsage()">📊 刷新用量</button>
-    </div>
-    <div class="acc-grid" id="accGrid"></div>
-  </details>
+  </aside>
 
-  <div class="grid-2">
-    <div class="card">
-      <h2>📊 近 7 天用量 <span class="badge" id="usageRange"></span></h2>
-      <div class="chart" id="usageChart"></div>
-      <div class="model-chips" id="modelChips"></div>
-    </div>
-    <div class="card">
-      <h2>⚡ 最近请求 <span class="badge" id="reqCount"></span></h2>
-      <div style="max-height: 240px; overflow-y: auto;">
-        <table>
-          <thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>耗时</th><th>Tokens</th></tr></thead>
-          <tbody id="reqTable"><tr><td colspan="6" class="muted">暂无请求</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
+  <main>
+    <div class="page">
 
-  <div class="card" style="margin-top:16px">
-    <h2>📈 账号 × 模型 用量（每日限量） <span class="badge" id="amUsageBadge"></span></h2>
-    <div style="max-height: 300px; overflow-y: auto;">
-      <table>
-        <thead><tr>
-          <th>账号</th><th>模型</th><th>次数</th><th>Tokens</th>
-          <th>限流(429)</th><th>使用率</th><th>每日限量（次 / tk）</th>
-        </tr></thead>
-        <tbody id="accModelTable"><tr><td colspan="7" class="muted">暂无用量记录</td></tr></tbody>
-      </table>
-    </div>
-    <div style="margin-top:10px">
-      <button class="btn btn-primary" onclick="saveUsageLimits()">💾 保存限量</button>
-      <span class="muted" id="limitMsg">0 = 不限。限量仅作用量展示，不拦截请求。</span>
-    </div>
-  </div>
-
-  <div class="grid-2">
-    <div>
-      <details>
-        <summary>➕ 添加账号</summary>
-        <div class="form-grid">
-          <div><label>名称（如：主号）</label><input id="f_name" placeholder="主号"></div>
-          <div><label>账号标识（备注）</label><input id="f_user" placeholder="邮箱/手机号"></div>
-          <div style="grid-column: span 2;"><label>Refresh Token（长效令牌）</label><input id="f_token" placeholder="从 rt_auth.py --export-rt 导出"></div>
-          <div><label>优先级（1=主账号）</label><input id="f_priority" type="number" value="100"></div>
-          <div><label>可用积分（0=自动刷新）</label><input id="f_total" type="number" value="0"></div>
-          <div><label>已用积分（0=自动）</label><input id="f_used" type="number" value="0"></div>
+      <!-- ============ 总览 ============ -->
+      <section class="view active" id="view-dashboard">
+        <div class="stats">
+          <div class="stat"><div class="label">👥 账号总数</div><div class="value" id="st_accounts">-</div>
+            <div class="delta" id="st_accounts_sub">-</div></div>
+          <div class="stat"><div class="label">💰 总可用积分</div><div class="value" id="st_credits">-</div>
+            <div class="delta">所有账号实时余额之和</div></div>
+          <div class="stat"><div class="label">🌅 今日签到</div><div class="value" id="st_checkin">-</div>
+            <div class="delta" id="st_checkin_sub">-</div></div>
+          <div class="stat"><div class="label">📊 近 7 天代理请求</div><div class="value" id="st_requests">-</div>
+            <div class="delta" id="st_requests_sub">-</div></div>
         </div>
-        <button class="btn btn-primary" onclick="addAccount()">添加账号</button>
-        <span class="muted" style="margin-left:10px">令牌随刷新自动轮换更新</span>
 
-        <div class="oauth-box">
-          <div class="oauth-title">🔑 官网扫码登录（CLI 通道，免手工导出令牌）</div>
-          <div class="muted" style="line-height:1.7;margin-bottom:10px">
-            点「开始授权」→ 打开官方登录页：<b>国内版微信扫码</b>，国际版网页登录 → 自动取回令牌，
-            <b>同时写入面板与代理池</b>，无需重启容器。
-            仍需本人在官方页完成一次登录；会话 10 分钟内有效，令牌只在后端流转。
+        <div id="activeBanner" class="banner">加载中…</div>
+
+        <div class="card">
+          <h2>🧭 今日用量推荐 <span class="badge goal">到期优先</span>
+            <span class="right"><button class="btn" onclick="showView('recommend')">查看完整推荐 →</button></span></h2>
+          <div id="recSummary"><span class="muted">加载中…</span></div>
+        </div>
+
+        <div class="card">
+          <h2>👥 账号管理
+            <span class="right">
+              <button class="btn btn-primary" onclick="checkinAll()">🌅 全部签到</button>
+              <button class="btn" onclick="refreshAllQuota()">💰 刷新全部余额</button>
+            </span></h2>
+          <div class="concept" style="margin-bottom:12px">
+            📖 <b>积分</b>是账号维度的全局资源，是使用任何模型的前提——积分耗尽则所有模型均不可用；
+            <b>额度</b>是每个模型每日独立分配的用量，某模型当日额度用尽仅该模型不可用。两道闸门全部通过才能调用。本面板「可用积分」为积分层真实值。
           </div>
-          <div class="form-grid">
-            <div><label>版本</label><select id="o_realm">
-              <option value="cn">国内版（copilot.tencent.com）</option>
-              <option value="intl">国际版（workbuddy.ai）</option></select></div>
-            <div><label>名称（留空用官方昵称）</label><input id="o_name" placeholder="如：姐姐大号"></div>
-            <div><label>优先级（1=主账号）</label><input id="o_priority" type="number" value="100"></div>
+          <div class="acc-grid" id="accGrid"></div>
+        </div>
+      </section>
+
+      <!-- ============ 用量推荐 ============ -->
+      <section class="view" id="view-recommend">
+        <div class="view-head">
+          <h2>🧭 每日用量推荐</h2>
+          <span class="badge goal">目标：到期优先</span>
+          <span class="badge" id="recDate">-</span>
+          <span class="right">
+            <button class="btn" onclick="loadRecommendation()">↻ 重新计算</button>
+          </span>
+        </div>
+
+        <div class="card">
+          <h3>⚠️ 风险提示</h3>
+          <div class="risk-list" id="recRisks"><span class="muted">加载中…</span></div>
+        </div>
+
+        <div class="card">
+          <h3>🎯 每模型推荐（主用 / 备选 / 今日分配）</h3>
+          <div class="table-scroll tall">
+            <table>
+              <thead><tr><th style="min-width:130px">模型</th><th>日均量</th><th style="min-width:170px">推荐主用</th><th>备选</th><th style="min-width:210px">今日建议分配（次）</th></tr></thead>
+              <tbody id="recModelTable"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+            </table>
           </div>
-          <button class="btn btn-primary" id="o_btn" onclick="oauthStart()">开始授权</button>
-          <button class="btn" id="o_cancel" style="display:none;margin-left:8px" onclick="oauthCancel()">取消</button>
-          <div class="oauth-status" id="o_status" style="display:none"></div>
         </div>
-      </details>
-      <details>
-        <summary>⚙️ 调度设置</summary>
-        <div class="form-grid">
-          <div><label>每日签到时间（随机抖动 ±30 分钟）</label><input id="s_checkin_time" placeholder="08:30"></div>
-          <div><label>余额告警阈值 (%)</label><input id="s_quota_min" type="number" placeholder="10"></div>
-          <div><label>自动切换</label><select id="s_switch"><option value="1">开启</option><option value="0">关闭</option></select></div>
-          <div style="grid-column: span 2;"><label>企业微信机器人 Webhook（异常/到期告警，留空不通知）</label><input id="s_wecom" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"></div>
+
+        <div class="card">
+          <h3>👤 每账号今日计划</h3>
+          <div class="table-scroll tall">
+            <table>
+              <thead><tr><th>账号</th><th>可用积分</th><th>到期</th><th>今日积分目标</th><th>建议承接（次）</th><th>承接模型</th></tr></thead>
+              <tbody id="recAccTable"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+            </table>
+          </div>
+          <div class="concept">
+            📖 计算依据：模型日均量 = 近 7 天总请求 ÷ 7；账号日预算权重 = 可用积分 ÷ 剩余天数（无到期时间按 30 天平滑，未知预算取中位数）；
+            分配不超过已设置的账号×模型每日限量；失败率 &gt;30%（样本 ≥5）的账号×模型会被降权。
+            日志只记请求数/token、不记积分消耗，故建议量以「次」计，积分只作预算约束（每日积分目标 = 可用 ÷ 剩余天数）。
+          </div>
         </div>
-        <button class="btn btn-primary" onclick="saveSettings()">保存设置</button>
-      </details>
+      </section>
+
+      <!-- ============ 用量统计 ============ -->
+      <section class="view" id="view-usage">
+        <div class="view-head">
+          <h2>📊 用量统计</h2>
+          <span class="right"><button class="btn" onclick="loadUsage()">↻ 刷新用量</button></span>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <h2>📈 近 7 天用量 <span class="badge" id="usageRange"></span></h2>
+            <div class="chart" id="usageChart"></div>
+            <div class="model-chips" id="modelChips"></div>
+          </div>
+          <div class="card">
+            <h2>⚡ 最近请求 <span class="badge" id="reqCount"></span></h2>
+            <div class="table-scroll">
+              <table>
+                <thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>耗时</th><th>Tokens</th></tr></thead>
+                <tbody id="reqTable"><tr><td colspan="6" class="muted">暂无请求</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>📉 账号 × 模型 用量（每日限量） <span class="badge" id="amUsageBadge"></span></h2>
+          <div class="table-scroll">
+            <table>
+              <thead><tr>
+                <th>账号</th><th>模型</th><th>次数</th><th>Tokens</th>
+                <th>限流(429)</th><th>使用率</th><th>每日限量（次 / tk）</th>
+              </tr></thead>
+              <tbody id="accModelTable"><tr><td colspan="7" class="muted">暂无用量记录</td></tr></tbody>
+            </table>
+          </div>
+          <div style="margin-top:10px">
+            <button class="btn btn-primary" onclick="saveUsageLimits()">💾 保存限量</button>
+            <span class="muted" id="limitMsg">0 = 不限。限量仅作用量展示，不拦截请求。</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 账号与设置 ============ -->
+      <section class="view" id="view-manage">
+        <div class="view-head"><h2>⚙️ 账号与设置</h2></div>
+        <div class="grid-2">
+          <div>
+            <div class="card">
+              <h3>➕ 添加账号</h3>
+              <div class="form-grid">
+                <div><label>名称（如：主号）</label><input id="f_name" placeholder="主号"></div>
+                <div><label>账号标识（备注）</label><input id="f_user" placeholder="邮箱/手机号"></div>
+                <div style="grid-column: span 2;"><label>Refresh Token（长效令牌）</label><input id="f_token" placeholder="从 rt_auth.py --export-rt 导出"></div>
+                <div><label>优先级（1=主账号）</label><input id="f_priority" type="number" value="100"></div>
+                <div><label>可用积分（0=自动刷新）</label><input id="f_total" type="number" value="0"></div>
+                <div><label>已用积分（0=自动）</label><input id="f_used" type="number" value="0"></div>
+              </div>
+              <button class="btn btn-primary" onclick="addAccount()">添加账号</button>
+              <span class="muted" style="margin-left:10px">令牌随刷新自动轮换更新</span>
+
+              <div class="oauth-box">
+                <div class="oauth-title">🔑 官网扫码登录（CLI 通道，免手工导出令牌）</div>
+                <div class="muted" style="line-height:1.7;margin-bottom:10px">
+                  点「开始授权」→ 打开官方登录页：<b>国内版微信扫码</b>，国际版网页登录 → 自动取回令牌，
+                  <b>同时写入面板与代理池</b>，无需重启容器。
+                  仍需本人在官方页完成一次登录；会话 10 分钟内有效，令牌只在后端流转。
+                </div>
+                <div class="form-grid">
+                  <div><label>版本</label><select id="o_realm">
+                    <option value="cn">国内版（copilot.tencent.com）</option>
+                    <option value="intl">国际版（workbuddy.ai）</option></select></div>
+                  <div><label>名称（留空用官方昵称）</label><input id="o_name" placeholder="如：姐姐大号"></div>
+                  <div><label>优先级（1=主账号）</label><input id="o_priority" type="number" value="100"></div>
+                </div>
+                <button class="btn btn-primary" id="o_btn" onclick="oauthStart()">开始授权</button>
+                <button class="btn" id="o_cancel" style="display:none;margin-left:8px" onclick="oauthCancel()">取消</button>
+                <div class="oauth-status" id="o_status" style="display:none"></div>
+              </div>
+            </div>
+
+            <div class="card">
+              <h3>🕐 调度设置</h3>
+              <div class="form-grid">
+                <div><label>每日签到时间（随机抖动 ±30 分钟）</label><input id="s_checkin_time" placeholder="08:30"></div>
+                <div><label>余额告警阈值 (%)</label><input id="s_quota_min" type="number" placeholder="10"></div>
+                <div><label>自动切换</label><select id="s_switch"><option value="1">开启</option><option value="0">关闭</option></select></div>
+                <div style="grid-column: span 2;"><label>企业微信机器人 Webhook（异常/到期告警，留空不通知）</label><input id="s_wecom" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"></div>
+              </div>
+              <button class="btn btn-primary" onclick="saveSettings()">保存设置</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>📜 签到日志</h3>
+            <div class="table-scroll tall">
+              <table>
+                <thead><tr><th>时间</th><th>账号</th><th>结果</th><th>详情</th><th>奖励</th></tr></thead>
+                <tbody id="logTable"><tr><td colspan="5" class="muted">暂无日志</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
     </div>
-    <div class="card">
-      <h2>📜 签到日志</h2>
-      <div style="max-height: 260px; overflow-y: auto;">
-        <table>
-          <thead><tr><th>时间</th><th>账号</th><th>结果</th><th>详情</th><th>奖励</th></tr></thead>
-          <tbody id="logTable"><tr><td colspan="5" class="muted">暂无日志</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
+  </main>
 </div>
 <div class="toast" id="toast"></div>
-
 <script>
 const API = '';
 const AVATAR_COLORS = ['#5b8cff', '#7c5bff', '#34d399', '#f59e0b', '#f87171', '#22d3ee'];
+const SHARE_COLORS = ['#5b8cff', '#7c5bff', '#34d399', '#f59e0b', '#f87171', '#22d3ee', '#a78bfa', '#f472b6'];
+
+// ---- 视图切换 ----
+function showView(name) {
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + name));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.view === name));
+  if (name === 'recommend') loadRecommendation();
+  window.scrollTo({ top: 0 });
+}
 
 // ---- 主题 ----
 function toggleTheme() {
@@ -319,19 +464,25 @@ async function req(method, url, body) {
   if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.detail || r.statusText); }
   return r.json();
 }
-
-// ---- 账号卡片 ----
-let pinnedName = null;
-let ACCOUNTS = [];                       // 当前账号缓存（供备注编辑等按 id 取值）
 function esc(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
+function fmtTokens(n) {
+  n = n || 0;
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'k';
+  return n;
+}
+
+// ---- 账号卡片 ----
+let pinnedName = null;
+let ACCOUNTS = [];
 async function editNote(id) {
   const acc = ACCOUNTS.find(a => a.id === id);
   if (!acc) return;
   const val = prompt('备注内容（留空并确定可清除）：', acc.note || '');
-  if (val === null) return;              // 用户取消
+  if (val === null) return;
   try {
     await req('PUT', '/api/accounts/' + id, { note: val.trim() });
     toast(val.trim() ? '备注已保存' : '备注已清除');
@@ -378,7 +529,7 @@ async function loadAccounts() {
   document.getElementById('st_checkin').textContent = checkedIn + '/' + accs.length;
   document.getElementById('st_checkin_sub').textContent = '每天自动签到 + 随机抖动';
   if (!accs.length) {
-    grid.innerHTML = '<div class="muted">暂无账号，展开「添加账号」添加</div>';
+    grid.innerHTML = '<div class="muted">暂无账号，去「账号与设置」添加</div>';
     return;
   }
   grid.innerHTML = accs.map((a, i) => {
@@ -386,7 +537,7 @@ async function loadAccounts() {
     const p = a.quota_percent;
     const cls = p <= 10 ? 'danger' : (p <= 30 ? 'warn' : '');
     const color = AVATAR_COLORS[i % AVATAR_COLORS.length];
-    const go = !!a.gateway_only;                       // 仅存在于网关池，面板未纳管
+    const go = !!a.gateway_only;
     const pill = go ? '<span class="pill gateway">仅代理</span>'
                     : `<span class="pill ${a.status}">${a.status === 'active' ? '正常' : a.status === 'error' ? '异常' : '停用'}</span>`;
     const note = go
@@ -470,7 +621,6 @@ async function loadUsage() {
     const chart = document.getElementById('usageChart');
     if (!days.length) { chart.innerHTML = '<div class="muted" style="margin:auto">近 7 天暂无代理请求</div>'; }
     else {
-      // 补齐最近 7 天的空档
       const map = Object.fromEntries(days.map(x => [x.date, x]));
       const labels = [];
       for (let i = 6; i >= 0; i--) {
@@ -491,9 +641,8 @@ async function loadUsage() {
       }).join('');
     }
     document.getElementById('modelChips').innerHTML = d.by_model.map(m =>
-      `<span class="chip">${m.model} · <b>${m.requests}</b> 次 · ${fmtTokens(m.tin + m.tout)} tk</span>`).join('')
+      `<span class="chip">${esc(m.model)} · <b>${m.requests}</b> 次 · ${fmtTokens(m.tin + m.tout)} tk</span>`).join('')
       || '<span class="muted">暂无模型数据</span>';
-    // 账号 × 模型 用量（含每日限量对比）
     const amRows = d.by_account_model || [];
     document.getElementById('amUsageBadge').textContent = d.since + ' 起';
     const amTb = document.getElementById('accModelTable');
@@ -562,14 +711,101 @@ async function saveUsageLimits() {
     msg.textContent = '保存失败: ' + (e && e.message ? e.message : e);
   }
 }
-function fmtTokens(n) {
-  n = n || 0;
-  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
-  if (n >= 1e3) return (n/1e3).toFixed(1) + 'k';
-  return n;
+
+// ---- 用量推荐 ----
+let REC = null;
+async function loadRecommendation() {
+  try {
+    REC = await req('GET', '/api/usage/recommendation');
+    renderRecommendation();
+  } catch (e) {
+    const s = document.getElementById('recSummary');
+    if (s) s.innerHTML = '<span class="muted">推荐加载失败: ' + esc(e.message) + '</span>';
+  }
+}
+function renderRecommendation() {
+  if (!REC) return;
+  document.getElementById('recDate').textContent = (REC.date || '') + ' · 近 ' + REC.window_days + ' 天数据';
+  const badge = document.getElementById('recRiskBadge');
+  if (REC.risks.length) { badge.style.display = 'inline-block'; badge.textContent = REC.risks.length; }
+  else badge.style.display = 'none';
+  // 首页摘要：前 3 个模型的主用 + 风险数
+  const sum = document.getElementById('recSummary');
+  if (!REC.models.length) {
+    sum.innerHTML = '<span class="muted">近 7 天暂无代理请求，先有真实用量才能给出推荐。</span>';
+  } else {
+    sum.innerHTML = REC.models.slice(0, 3).map(m => {
+      const p = m.primary
+        ? `<b>${esc(m.primary.account)}</b>` : '<span class="log-fail">无可用账号</span>';
+      const why = m.primary && m.primary.reasons.length
+        ? `<span class="muted">（${esc(m.primary.reasons[0])}）</span>` : '';
+      return `<div class="summary-line"><span class="m">${esc(m.model)}</span><span class="arrow">→ 主用</span>${p}${why}<span class="muted">· 日均 ${m.expected_daily_requests} 次</span></div>`;
+    }).join('') + (REC.risks.length
+      ? `<div class="summary-line" style="color:var(--yellow)">⚠️ ${REC.risks.length} 条风险提示，点「查看完整推荐」处理</div>` : '');
+  }
+  // 风险
+  const risks = document.getElementById('recRisks');
+  risks.innerHTML = REC.risks.length
+    ? REC.risks.map(r => `<div class="risk ${(r.type === 'no_candidate' || r.type === 'error') ? 'red' : ''}">⚠️ <span>${esc(r.message)}</span></div>`).join('')
+    : '<span class="muted">暂无风险提示 🎉</span>';
+  // 每模型推荐
+  const mt = document.getElementById('recModelTable');
+  if (!REC.models.length) {
+    mt.innerHTML = '<tr><td colspan="5" class="muted">近 7 天暂无代理请求</td></tr>';
+  } else {
+    mt.innerHTML = REC.models.map(m => {
+      const prim = m.primary
+        ? `<div class="rec-primary">${esc(m.primary.account)}</div>` +
+          m.primary.reasons.map(r => `<div class="rec-reason">· ${esc(r)}</div>`).join('')
+        : '<span class="log-fail">无可用账号</span>';
+      const back = m.backup
+        ? `<div>${esc(m.backup.account)}</div>` +
+          m.backup.reasons.map(r => `<div class="rec-reason">· ${esc(r)}</div>`).join('')
+        : '<span class="muted">—</span>';
+      let shares = '<span class="muted">—</span>';
+      if (m.shares.length) {
+        const bar = m.shares.map((s, i) =>
+          `<div style="width:${Math.max(0, s.share_pct)}%;background:${SHARE_COLORS[i % SHARE_COLORS.length]}" title="${esc(s.account)} ${s.share_pct}%"></div>`).join('');
+        const legend = m.shares.map((s, i) =>
+          `<b style="color:${SHARE_COLORS[i % SHARE_COLORS.length]}">■</b> ${esc(s.account)} <b>${s.suggested_requests}</b> 次${s.limit_requests ? `（限 ${s.limit_requests}）` : ''}`).join(' · ');
+        shares = `<div class="sharebar">${bar}</div><div class="share-legend">${legend}</div>`;
+      }
+      return `<tr>
+        <td class="code">${esc(m.model)}</td>
+        <td>${m.expected_daily_requests} 次</td>
+        <td>${prim}</td>
+        <td>${back}</td>
+        <td>${shares}</td>
+      </tr>`;
+    }).join('');
+  }
+  // 每账号计划
+  const at = document.getElementById('recAccTable');
+  if (!REC.accounts.length) {
+    at.innerHTML = '<tr><td colspan="6" class="muted">暂无账号</td></tr>';
+  } else {
+    at.innerHTML = REC.accounts.map(a => {
+      const days = a.days_left === null || a.days_left === undefined
+        ? '<span class="muted">—</span>'
+        : `<span class="days-badge ${a.days_left <= 3 ? 'hot' : (a.days_left <= 7 ? 'warm' : '')}">${a.expire_at ? esc(String(a.expire_at).slice(5, 10)) + ' · ' : ''}剩 ${a.days_left} 天</span>`;
+      const models = a.models.length
+        ? a.models.map(x => `<span class="chip">${esc(x.model)} · <b>${x.suggested_requests}</b></span>`).join(' ')
+        : '<span class="muted">—</span>';
+      const excluded = a.candidate ? '' :
+        `<div class="rec-reason" style="color:var(--yellow)">未参与分配：${esc(a.excluded_reason || '')}</div>`;
+      return `<tr>
+        <td><b>${esc(a.account)}</b>${excluded}</td>
+        <td>${a.available_credits === null || a.available_credits === undefined ? '<span class="muted">未知</span>' : Math.round(a.available_credits * 100) / 100}</td>
+        <td>${days}</td>
+        <td>${a.daily_credits_target === null || a.daily_credits_target === undefined ? '<span class="muted">—</span>' : a.daily_credits_target + ' 分/天'}</td>
+        <td><b>${a.suggested_requests}</b> 次</td>
+        <td>${models}</td>
+      </tr>`;
+    }).join('');
+  }
 }
 
-// ---- 签到日志 ----
+// ---- 签到日志与设置 ----
 async function loadLogs() {
   const d = await req('GET', '/api/logs?limit=50');
   const tb = document.getElementById('logTable');
@@ -586,6 +822,15 @@ async function loadSettings() {
   document.getElementById('s_quota_min').value = s.quota_min_percent || '';
   document.getElementById('s_switch').value = s.switch_enabled || '1';
   document.getElementById('s_wecom').value = s.wecom_webhook || '';
+}
+async function saveSettings() {
+  await req('PUT', '/api/settings', {
+    checkin_time: document.getElementById('s_checkin_time').value.trim(),
+    quota_min_percent: parseFloat(document.getElementById('s_quota_min').value) || 10,
+    switch_enabled: document.getElementById('s_switch').value,
+    wecom_webhook: document.getElementById('s_wecom').value.trim(),
+  });
+  toast('设置已保存');
 }
 
 // ---- 官方 OAuth 设备授权登录 ----
@@ -641,7 +886,7 @@ async function oauthTick() {
       oauthRender('❌ ' + (r.message || '授权未完成'));
     }
   } catch (e) {
-    oauthRender('⏳ 网络重试中：' + e.message);   // 抖动不中断，保留 state 继续轮询
+    oauthRender('⏳ 网络重试中：' + e.message);
   }
 }
 async function oauthCancel() {
@@ -651,7 +896,7 @@ async function oauthCancel() {
   if (s) { try { await req('POST', '/api/login/cancel', { state: s }); } catch (_) {} }
 }
 
-// ---- 操作 ----
+// ---- 账号操作 ----
 async function addAccount() {
   const body = {
     name: document.getElementById('f_name').value.trim(),
@@ -714,23 +959,14 @@ async function checkinAll() {
 async function refreshAllQuota() {
   const d = await req('GET', '/api/accounts');
   for (const a of d.accounts) {
-    if (a.id == null) continue;   // 仅代理池账号没有面板令牌，跳过
+    if (a.id == null) continue;
     try { await req('POST', `/api/accounts/${a.id}/refresh-quota`); } catch (e) {}
   }
   toast('可用积分刷新完成'); loadAccounts(); loadActive();
 }
-async function saveSettings() {
-  await req('PUT', '/api/settings', {
-    checkin_time: document.getElementById('s_checkin_time').value.trim(),
-    quota_min_percent: parseFloat(document.getElementById('s_quota_min').value) || 10,
-    switch_enabled: document.getElementById('s_switch').value,
-    wecom_webhook: document.getElementById('s_wecom').value.trim(),
-  });
-  toast('设置已保存');
-}
 
-loadAccounts(); loadActive(); loadLogs(); loadSettings(); loadUsage(); loadPin();
-setInterval(() => { loadAccounts(); loadActive(); loadUsage(); }, 60000);
+loadAccounts(); loadActive(); loadLogs(); loadSettings(); loadUsage(); loadPin(); loadRecommendation();
+setInterval(() => { loadAccounts(); loadActive(); loadUsage(); loadRecommendation(); }, 60000);
 </script>
 </body>
 </html>

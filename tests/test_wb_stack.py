@@ -262,3 +262,73 @@ def test_pick_excludes_tried_accounts(rot):
     assert rot.pick_available_session(sessions).name == "一号"
     assert rot.pick_available_session(sessions, exclude=["一号"]).name == "二号"
     assert rot.pick_available_session(sessions, exclude=["一号", "二号"]) is None
+
+
+# --------------------------------------------------------------------------
+# 每日用量推荐引擎（app/recommendation.py）
+# --------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def rec():
+    spec = importlib.util.spec_from_file_location(
+        "recommendation_mod",
+        os.path.join(ROOT, "wb-manager", "app", "recommendation.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _acc(name, **kw):
+    base = {"name": name, "available": None, "days_left": None, "expire_at": None,
+            "status": "active", "in_gateway": True,
+            "gateway_disabled": False, "gateway_exhausted": False}
+    base.update(kw)
+    return base
+
+
+def test_recommendation_expiry_first(rec):
+    accounts = [_acc("富裕号", available=900, days_left=30),
+                _acc("临期号", available=300, days_left=2)]
+    usage = {("富裕号", "m1"): {"requests": 70, "tokens": 1000, "failed": 0, "limited": 0},
+             ("临期号", "m1"): {"requests": 70, "tokens": 1000, "failed": 0, "limited": 0}}
+    out = rec.build_recommendation(accounts, usage, {}, window_days=7)
+    m = out["models"][0]
+    assert m["primary"]["account"] == "临期号"          # 到期最近者优先
+    assert m["backup"]["account"] == "富裕号"
+    assert sum(s["suggested_requests"] for s in m["shares"]) == 20   # 日均 140/7
+    assert any(r["type"] == "expiring" and r["account"] == "临期号" for r in out["risks"])
+
+
+def test_recommendation_respects_limits(rec):
+    accounts = [_acc("A", available=100, days_left=5),
+                _acc("B", available=100, days_left=5)]
+    usage = {("A", "m1"): {"requests": 700, "tokens": 1, "failed": 0, "limited": 0}}
+    limits = {"A|m1": {"requests": 10, "tokens": 0}}
+    out = rec.build_recommendation(accounts, usage, limits, window_days=7)
+    shares = {s["account"]: s["suggested_requests"] for s in out["models"][0]["shares"]}
+    assert shares["A"] == 10                            # 被每日限量封顶
+    assert shares["B"] == 90                            # 溢出转移到 B
+
+
+def test_recommendation_excludes_dead_and_flags_single(rec):
+    accounts = [_acc("活号", available=50, days_left=9),
+                _acc("空号", available=0, days_left=9),
+                _acc("坏号", available=50, days_left=9, status="error")]
+    usage = {("活号", "m1"): {"requests": 14, "tokens": 1, "failed": 0, "limited": 0}}
+    out = rec.build_recommendation(accounts, usage, {}, window_days=7)
+    m = out["models"][0]
+    assert m["primary"]["account"] == "活号" and m["backup"] is None
+    types = {(r["type"], r.get("account")) for r in out["risks"]}
+    assert ("single_account", "活号") in types
+    assert ("exhausted", "空号") in types and ("error", "坏号") in types
+    by_name = {a["account"]: a for a in out["accounts"]}
+    assert by_name["空号"]["candidate"] is False
+    assert by_name["活号"]["daily_credits_target"] == round(50 / 9, 1)
+
+
+def test_recommendation_deprioritizes_unhealthy(rec):
+    accounts = [_acc("稳号", available=100, days_left=10),
+                _acc("抖号", available=100, days_left=10)]
+    usage = {("稳号", "m1"): {"requests": 10, "tokens": 1, "failed": 0, "limited": 0},
+             ("抖号", "m1"): {"requests": 10, "tokens": 1, "failed": 8, "limited": 0}}
+    out = rec.build_recommendation(accounts, usage, {}, window_days=7)
+    assert out["models"][0]["primary"]["account"] == "稳号"

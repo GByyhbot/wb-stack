@@ -112,17 +112,17 @@ class SwitchRequest(BaseModel):
 
 @app.get("/")
 async def index():
-    return FileResponse("static/index.html")
+    # 与 /static 挂载同口径：按文件位置解析，不依赖启动 CWD（相对路径曾让
+    # 非 wb-manager 目录启动时首页 500）
+    return FileResponse(str(Path(__file__).resolve().parent.parent / "static" / "index.html"))
 
 
 # ---------- 用量统计（读取 rotator 的请求记账日志） ----------
 
-@app.get("/api/usage")
-def api_usage(days: int = 7):
-    """聚合 wb-rotator 的 JSONL 请求日志：按日趋势 + 按模型 + 按账号×模型（含每日限额对比）"""
+def _collect_usage(days):
+    """解析 rotator 请求日志，返回窗口内聚合（api_usage 与用量推荐共用一份口径）。
+    返回 {since, per_day, by_model, by_acc_model, recent(deque)}。"""
     import json, glob, collections, datetime as dt
-    # rotator 的数据目录统一由 _rotator_home() 解析（容器内 = WB_ROTATOR_HOME）。
-    # 不能只靠 __file__ 相对层级：容器里 /app/app/main.py 上溯三层是根目录，会找不到日志。
     log_dir = _rotator_home() / "logs"
     since = (dt.datetime.now() - dt.timedelta(days=max(1, min(days, 90)))).strftime("%F")
     per_day = collections.defaultdict(lambda: {"requests": 0, "tin": 0, "tout": 0})
@@ -184,6 +184,19 @@ def api_usage(days: int = 7):
             except Exception:
                 continue
 
+    return {"since": since, "per_day": per_day, "by_model": by_model,
+            "by_acc_model": by_acc_model, "recent": recent}
+
+
+@app.get("/api/usage")
+def api_usage(days: int = 7):
+    """聚合 wb-rotator 的 JSONL 请求日志：按日趋势 + 按模型 + 按账号×模型（含每日限额对比）"""
+    _col = _collect_usage(days)
+    since = _col["since"]
+    per_day = _col["per_day"]
+    by_model = _col["by_model"]
+    by_acc_model = _col["by_acc_model"]
+    recent = _col["recent"]
     # 合并每日限额配置，给出使用率（限额未设/0 表示不限，使用率返回 null）
     limits = _load_usage_limits()
     def _pct(used, lim):
@@ -220,6 +233,58 @@ def api_usage(days: int = 7):
         "limits": limits,
         "recent": list(recent)[::-1],
     }
+
+
+@app.get("/api/usage/recommendation")
+def api_usage_recommendation():
+    """每日用量推荐：每模型主/备账号 + 每账号今日建议量（引擎在 app/recommendation.py）。
+
+    数据来源：近 7 天请求日志聚合（与 /api/usage 同一份口径）、面板账号的
+    可用积分与到期时间、网关池的禁用/耗尽状态、每日限量配置。
+    """
+    import datetime as dt
+    from . import recommendation as rec_mod
+    col = _collect_usage(7)
+    usage = {}
+    for (acc, m), v in col["by_acc_model"].items():
+        usage[(acc, m)] = {"requests": v["requests"], "tokens": v["tin"] + v["tout"],
+                           "failed": v["failed"], "limited": v["limited"]}
+    gw = _gateway_accounts()
+    today_str = dt.datetime.now().strftime("%F")
+    accounts = []
+    panel_names = []
+    for a in db.list_accounts():
+        panel_names.append(a["name"])
+        g = gateway_sync.find_pool_entry(gw, a["name"])
+        days_left = None
+        expire = a.get("quota_expire_at")
+        if expire:
+            try:
+                days_left = (dt.datetime.fromisoformat(str(expire)) - dt.datetime.now()).days
+            except Exception:
+                days_left = None
+        accounts.append({
+            "name": a["name"],
+            "available": db.account_available_credits(a),
+            "days_left": days_left,
+            "expire_at": expire,
+            "status": a.get("status"),
+            "in_gateway": g is not None,
+            "gateway_disabled": bool(g and g.get("disabled")),
+            "gateway_exhausted": bool(g and g.get("exhausted_date") == today_str),
+        })
+    for g in gw:
+        nm = (g.get("name") or "").strip()
+        if nm and _resolve_name(nm, panel_names) is None:
+            accounts.append({
+                "name": nm, "available": None, "days_left": None, "expire_at": None,
+                "status": "gateway", "in_gateway": True,
+                "gateway_disabled": bool(g.get("disabled")),
+                "gateway_exhausted": g.get("exhausted_date") == today_str,
+            })
+    out = rec_mod.build_recommendation(accounts, usage, _load_usage_limits(), window_days=7)
+    out["date"] = today_str
+    return out
 
 
 @app.get("/api/usage/limits")
