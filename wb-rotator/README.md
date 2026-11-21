@@ -111,10 +111,8 @@ python account_switch.py launch        # 再启动客户端
 
 ## ⚠️ 令牌注意事项（同 NAS 平台）
 
-- 配置里的 `refresh_token` 是**轮换型**：代理每次刷新会自动把新令牌写回 `accounts.json`
-- **同一把 refresh token 只能在一处使用**。同一账号如果同时配置在：
-  本代理、NAS wb-manager 平台、本机签到技能 —— 三边会互相刷新导致其他边失效。
-  多账号请各自导出独立 token，一处一个。
+- 配置里的 `refresh_token` 是**轮换型**：代理每次刷新会自动把新令牌写回 `accounts.json`，并（同机部署时经 `WB_DB_PATH`）同步回 NAS wb-manager 平台的数据库；`accounts.json` 的整表读-改-写持有跨进程文件锁（`accounts.json.lock`），面板/CLI 并发写不会互相覆盖。
+- **同一把 refresh token 只能在一处使用**——例外只有本代理与 wb-manager 平台这一对（已双向同步，见上）。若同一账号还配置在本机签到技能等**栈外第三方**，仍会互相刷新导致其他边失效。多账号请各自导出独立 token，栈外一处一个。
 - 导出 refresh token（在已登录的电脑上）：
   `python ~/.workbuddy/skills/totorosir-workbuddy-checkin__skillhub/scripts/rt_auth.py --export-rt`
 

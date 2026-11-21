@@ -20,12 +20,17 @@ import subprocess
 import sys
 import time
 
-AUTH_FILE = r"C:\Users\Administrator\AppData\Local\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info"
+# 路径可用环境变量覆盖（WB_AUTH_FILE / WB_CLIENT_EXE / WB_RT_AUTH），换机器免改代码
+AUTH_FILE = os.environ.get(
+    "WB_AUTH_FILE",
+    r"C:\Users\Administrator\AppData\Local\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info")
 SNAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapshots")
 META_FILE = os.path.join(SNAP_DIR, "meta.json")
-CLIENT_EXE = r"D:\workbuddy\WorkBuddy.exe"
-RT_AUTH = (r"C:\Users\Administrator\.workbuddy\skills"
-           r"\totorosir-workbuddy-checkin__skillhub\scripts\rt_auth.py")
+CLIENT_EXE = os.environ.get("WB_CLIENT_EXE", r"D:\workbuddy\WorkBuddy.exe")
+RT_AUTH = os.environ.get(
+    "WB_RT_AUTH",
+    r"C:\Users\Administrator\.workbuddy\skills"
+    r"\totorosir-workbuddy-checkin__skillhub\scripts\rt_auth.py")
 
 
 def load_meta():

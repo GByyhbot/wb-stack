@@ -133,6 +133,40 @@ _lock = threading.RLock()
 
 
 # ----------------------------------------------------------------------------
+# 跨进程文件锁（A2）：accounts.json 的写者不止本进程——同容器的 wb-manager、
+# 以及手动运行的 rotator CLI 都会整表读-改-写。线程锁只管本进程；
+# 整表写回若基于旧快照，会把别的进程刚轮换的新令牌覆盖回旧值（令牌链断裂）。
+# 所有「读-改-写」序列必须持有这把文件锁；单纯读取靠 tmp+replace 原子写保证不读半截。
+# ----------------------------------------------------------------------------
+import contextlib
+
+
+@contextlib.contextmanager
+def _accounts_file_lock():
+    lock_path = ACCOUNTS_FILE + ".lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        os.close(fd)
+
+
+# ----------------------------------------------------------------------------
 # 账号池配置管理
 # ----------------------------------------------------------------------------
 def load_accounts():
@@ -142,9 +176,15 @@ def load_accounts():
         try:
             with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data.get("accounts", []) if isinstance(data, dict) else data
+            accounts = data.get("accounts", []) if isinstance(data, dict) else data
         except Exception:
             return []
+        # B2: 选号顺序以 priority 字段为准，不依赖文件物理顺序。
+        # 此前只有 rotator 自己的 add/serve 会把文件排好序，面板 OAuth 入库是
+        # append 到末尾，新账号 priority 再高也排在最后被选。
+        accounts = [a for a in accounts if isinstance(a, dict)]
+        accounts.sort(key=lambda a: (a.get("priority", 100), a.get("name") or ""))
+        return accounts
 
 
 def save_accounts(accounts):
@@ -175,6 +215,26 @@ def find_account(name):
 # ----------------------------------------------------------------------------
 def refresh_access_token(rt):
     """长效令牌换接口令牌。返回 (ok, access_token, new_rt, msg)"""
+    ok, at, new_rt, msg, _kind = refresh_access_token_ex(rt)
+    return ok, at, new_rt, msg
+
+
+class TokenAuthError(RuntimeError):
+    """上游明确拒绝（令牌失效/被轮换）：账号需标记耗尽并等待人工更新令牌"""
+
+
+class TokenNetworkError(RuntimeError):
+    """网络异常/上游 5xx：临时故障，不应把健康账号标记耗尽"""
+
+
+def refresh_access_token_ex(rt):
+    """同 refresh_access_token，额外返回失败类型 kind ∈ {ok, auth, network}。
+
+    B4: 此前调用方分不清「令牌死了」和「网络抖了一下」，一律整号标记当日耗尽，
+    一次网络抖动就能让健康账号下线一整天。这里把判定收敛到一处：
+    上游给出明确业务 code 的拒绝 = auth；连不上/超时/5xx 无业务码 = network。
+    返回 (ok, access_token, new_rt, msg, kind)
+    """
     req = urllib.request.Request(REFRESH_URL, data=b"{}", method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("X-Refresh-Token", rt)
@@ -187,15 +247,16 @@ def refresh_access_token(rt):
         try:
             body = json.loads(e.read())
         except Exception:
-            return False, "", "", "HTTP %s" % e.code
+            kind = "network" if e.code >= 500 else "auth"
+            return False, "", "", "HTTP %s" % e.code, kind
     except Exception as e:
-        return False, "", "", str(e)[:120]
+        return False, "", "", str(e)[:120], "network"
     if body.get("code") == 0 and isinstance(body.get("data"), dict):
         d = body["data"]
         at = d.get("accessToken") or ""
         if at:
-            return True, at, d.get("refreshToken") or "", "ok"
-    return False, "", "", "code=%s %s" % (body.get("code"), (body.get("msg") or "")[:100])
+            return True, at, d.get("refreshToken") or "", "ok", "ok"
+    return False, "", "", "code=%s %s" % (body.get("code"), (body.get("msg") or "")[:100]), "auth"
 
 
 def query_credits(rt):
@@ -232,7 +293,7 @@ def persist_rotation(acc, new_rt):
     """令牌轮换后回写配置文件"""
     if not new_rt or new_rt == acc.get("refresh_token"):
         return
-    with _lock:
+    with _lock, _accounts_file_lock():
         accounts = load_accounts()
         for a in accounts:
             if a.get("name") == acc.get("name"):
@@ -240,6 +301,32 @@ def persist_rotation(acc, new_rt):
                 break
         save_accounts(accounts)
         acc["refresh_token"] = new_rt
+    _sync_panel_db(acc.get("name"), new_rt)
+
+
+def _sync_panel_db(name, new_rt):
+    """A1: 网关轮换出的新令牌同步回面板 DB（同名精确匹配）。
+
+    背景：OAuth 入库把同一把轮换型 RT 同时写进面板 DB 与网关 accounts.json，
+    两边各自刷新、各自回写自己那份的话，必然有一边攥着上一代令牌互相刷死。
+    约定：谁刷新谁负责把新令牌同步到另一份存储。本函数处理「网关 → 面板」方向
+    （面板 → 网关方向在 wb-manager 的 app/gateway_sync.py）。
+    仅在 WB_DB_PATH 指向真实文件时生效（Docker 单容器部署）；本机单跑网关时
+    没有面板 DB，静默跳过。同步失败只记日志，不影响本次调用。
+    """
+    db_path = os.environ.get("WB_DB_PATH", "")
+    if not name or not db_path or not os.path.isfile(db_path):
+        return
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path, timeout=5)
+        try:
+            conn.execute("UPDATE accounts SET token=? WHERE name=?", (new_rt, name))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        sys.stderr.write("[rotator] 同步新令牌到面板 DB 失败(%s): %s\n" % (name, str(e)[:100]))
 
 
 # ----------------------------------------------------------------------------
@@ -267,9 +354,13 @@ class AccountSession:
         acc = self.current()
         if not acc:
             raise RuntimeError("账号已被移除(%s)" % self.name)
-        ok, at, new_rt, msg = refresh_access_token(acc["refresh_token"])
+        ok, at, new_rt, msg, kind = refresh_access_token_ex(acc["refresh_token"])
         if not ok:
-            raise RuntimeError("令牌刷新失败(%s): %s" % (self.name, msg))
+            # B4: 只有上游明确拒绝才按令牌失效处理；网络故障单独抛型，
+            # 由 _handle 决定「只跳过本次、不标记耗尽」。
+            if kind == "auth":
+                raise TokenAuthError("令牌刷新被拒(%s): %s" % (self.name, msg))
+            raise TokenNetworkError("令牌刷新网络失败(%s): %s" % (self.name, msg))
         self._at = at
         self._at_time = time.time()
         persist_rotation(acc, new_rt)
@@ -298,7 +389,7 @@ def confirm_exhausted(session):
 
 
 def mark_exhausted(name):
-    with _lock:
+    with _lock, _accounts_file_lock():
         accounts = load_accounts()
         for a in accounts:
             if a.get("name") == name:
@@ -327,13 +418,15 @@ def _sync_sessions():
                          (len(names), ", ".join(names)))
 
 
-def pick_available_session(sessions, model=None):
+def pick_available_session(sessions, model=None, exclude=None):
     """
     选一个可用账号会话（状态实时读文件）。
     P2: model 传入时做「账号×模型」级过滤——某模型当日耗尽/限流冷却中的账号被跳过，
     不整号拉黑（借鉴 icebears111/workbuddy2api 的配额感知切号）。
     手动置顶（pin.json）的账号优先选用。
+    exclude: 本次请求内已试过且失败的账号名集合，不再重复选（见 _handle）。
     """
+    exclude = set(exclude or ())
     td = today()
     accounts = {a.get("name"): a for a in load_accounts()}
     pinned = get_pinned()
@@ -342,6 +435,8 @@ def pick_available_session(sessions, model=None):
         acc = accounts.get(s.name)
         if not acc:
             return False  # 已被移除
+        if s.name in exclude:
+            return False  # 本次请求内已试过
         if acc.get("disabled"):
             return False
         if acc.get("exhausted_date") == td:
@@ -350,11 +445,13 @@ def pick_available_session(sessions, model=None):
             return False
         return True
 
-    # 置顶优先
+    # 置顶优先（B3: 名字先经 resolve_name 唯一解析，前缀多命中时不置顶，防串号）
     if pinned:
-        for s in sessions:
-            if _name_match(s.name, pinned) and usable(s):
-                return s
+        pin_name = resolve_name(pinned, [s.name for s in sessions])
+        if pin_name:
+            for s in sessions:
+                if s.name == pin_name and usable(s):
+                    return s
     for s in sessions:
         if usable(s):
             return s
@@ -389,7 +486,11 @@ def mark_model(name, model, kind):
             st[key] = {"date": today(), "hard": True}
         else:
             st[key] = {"date": today(), "cooldown_until": time.time() + SOFT_COOLDOWN_SECONDS}
-        json.dump(st, open(MODEL_STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        # C3: 与 accounts.json 一致的原子写（tmp + replace），避免读到半截文件整表丢弃
+        tmp = MODEL_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, MODEL_STATE_FILE)
 
 
 def model_blocked(name, model):
@@ -417,6 +518,22 @@ def _name_match(a, b):
     return a == b or a.startswith(b) or b.startswith(a)
 
 
+def resolve_name(target, candidates):
+    """B3: 在候选名集合中把 target 解析为唯一账号名。
+
+    _name_match 的前缀规则在「备用1 / 备用10」这类命名下会同时命中多个账号，
+    成对比较无法察觉。选号/置顶这类「按名找唯一账号」的路径必须先经这里：
+    全等优先；前缀匹配仅在全局唯一命中时生效；多命中返回 None（宁可不匹配）。
+    """
+    if not target:
+        return None
+    cands = [c for c in candidates if c]
+    if target in cands:
+        return target
+    hits = [c for c in cands if c.startswith(target) or target.startswith(c)]
+    return hits[0] if len(hits) == 1 else None
+
+
 # ----------------------------------------------------------------------------
 # SSE 流转发与聚合
 # ----------------------------------------------------------------------------
@@ -433,6 +550,8 @@ def aggregate_stream(resp):
     """把官方 SSE 聚合为 OpenAI 非流式响应 JSON"""
     content_parts = []
     reasoning_parts = []
+    tool_calls = {}
+    finish_reason = "stop"
     usage = None
     model = ""
     cid = ""
@@ -455,17 +574,37 @@ def aggregate_stream(resp):
                 content_parts.append(delta["content"])
             if delta.get("reasoning_content"):
                 reasoning_parts.append(delta["reasoning_content"])
+            # C1: 工具调用分片按 index 拼装（id 只在首片出现，参数是增量字符串）。
+            # 此前完全丢弃，stream=false + 工具调用时客户端只会拿到空回复。
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = tool_calls.setdefault(idx, {
+                    "id": "", "type": "function",
+                    "function": {"name": "", "arguments": ""}})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                if tc.get("type"):
+                    slot["type"] = tc["type"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["function"]["name"] += fn["name"]
+                if fn.get("arguments"):
+                    slot["function"]["arguments"] += fn["arguments"]
+            if ch.get("finish_reason"):
+                finish_reason = ch["finish_reason"]
         if chunk.get("usage"):
             usage = chunk["usage"]
     message = {"role": "assistant", "content": "".join(content_parts)}
     if reasoning_parts:
         message["reasoning_content"] = "".join(reasoning_parts)
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
     return {
         "id": cid or "rotator",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         "usage": usage or {},
     }
 
@@ -552,7 +691,6 @@ def cmd_usage(args):
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     sessions = []          # 类属性：账号会话列表（serve 启动时构建）
-    state = {"current": None}
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[%s] %s\n" % (datetime.now().strftime("%H:%M:%S"), fmt % args))
@@ -616,6 +754,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _pool_status(self):
         td = today()
         pinned = get_pinned()
+        pin_name = resolve_name(pinned, [s.name for s in self.sessions]) if pinned else None
         out = []
         for s in self.sessions:
             acc = s.current() or {}
@@ -625,7 +764,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "exhausted_today": acc.get("exhausted_date") == td,
                 "disabled": bool(acc.get("disabled")),
                 "credits": acc.get("last_credits"),
-                "pinned": _name_match(s.name, pinned),
+                "pinned": bool(pin_name) and s.name == pin_name,
             })
         return out
 
@@ -637,8 +776,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
-        # HTTP 头仅支持 ASCII：中文名 URL 编码后放入
-        account = self.state.get("current") or ""
+        # HTTP 头仅支持 ASCII：中文名 URL 编码后放入。
+        # 账号名取本次请求自己的记账上下文（_ctx），不用类级共享状态——
+        # 并发请求下共享 state 会让响应头串到别的请求的账号上。
+        account = (getattr(self, "_ctx", None) or {}).get("account") or ""
         self.send_header("X-Rotator-Account", urllib.parse.quote(account))
         self.end_headers()
         usage = None
@@ -720,7 +861,7 @@ def _handle(self, req_body):
 
     tried = []
     for _ in range(MAX_SWITCH_RETRY):
-        session = pick_available_session(self.sessions, self._ctx["model"])
+        session = pick_available_session(self.sessions, self._ctx["model"], exclude=tried)
         if session is None:
             self._json(503, {"error": {
                 "type": "all_accounts_exhausted",
@@ -731,6 +872,17 @@ def _handle(self, req_body):
         self._ctx["account"] = session.name
         try:
             at = session.get_access_token()
+        except TokenAuthError as e:
+            # 令牌确已失效：标记耗尽（等人工更新令牌后 reset/check 恢复）
+            sys.stderr.write("⚠️ %s，跳过该账号并标记耗尽\n" % e)
+            mark_exhausted(session.name)
+            continue
+        except TokenNetworkError as e:
+            # B4: 网络抖动只跳过本次请求，不把健康账号下线一整天。
+            # 该账号名已在选号时记入 tried 并经 exclude 传回选号器，
+            # 本次请求内不会再撞它（避免单账号池对着超时接口连撞数次才返回）。
+            sys.stderr.write("⚠️ %s，本次跳过（不标记耗尽）\n" % e)
+            continue
         except RuntimeError as e:
             sys.stderr.write("⚠️ %s，跳过该账号\n" % e)
             mark_exhausted(session.name)
@@ -772,7 +924,6 @@ def _handle(self, req_body):
             self._last_net_err = str(e)[:200]
             continue
 
-        self.state["current"] = session.name
         if want_stream:
             self._stream_response(resp)
         else:
@@ -828,7 +979,7 @@ def cmd_add(args):
     if not (len(rt) >= 200 and rt.count(".") == 2):
         print("❌ 内容不像有效的 refresh token（较长 base64 串，含两个点号）")
         sys.exit(1)
-    with _lock:
+    with _lock, _accounts_file_lock():
         accounts = load_accounts()
         if any(a.get("name") == args.name for a in accounts):
             print("❌ 账号名已存在: %s" % args.name)
@@ -863,7 +1014,7 @@ def cmd_list(args):
 
 
 def cmd_remove(args):
-    with _lock:
+    with _lock, _accounts_file_lock():
         accounts = load_accounts()
         new_list = [a for a in accounts if a.get("name") != args.name]
         if len(new_list) == len(accounts):
@@ -874,7 +1025,7 @@ def cmd_remove(args):
 
 
 def cmd_reset(args):
-    with _lock:
+    with _lock, _accounts_file_lock():
         accounts = load_accounts()
         n = 0
         for a in accounts:
@@ -898,11 +1049,8 @@ def cmd_check(args):
         if new_rt:
             persist_rotation(a, new_rt)
         if ok:
-            with _lock:
-                for x in load_accounts():
-                    pass
-            # 更新余额缓存
-            with _lock:
+            # 更新余额缓存（整段读-改-写持有跨进程文件锁，防与服务进程互相覆盖）
+            with _lock, _accounts_file_lock():
                 accs = load_accounts()
                 for x in accs:
                     if x.get("name") == a.get("name"):
