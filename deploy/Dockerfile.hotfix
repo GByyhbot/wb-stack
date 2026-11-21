@@ -1,0 +1,18 @@
+# 代码增量镜像：以现网 wb-single:latest 为基底，只覆盖应用代码层。
+#
+# 用途：NAS 上缺少 python:3.11-slim 基础镜像且镜像仓库镜像站返回 401，
+# 无法走完整 Dockerfile 构建。此文件不拉取任何远程镜像、不装依赖，纯本地 COPY，
+# 构建耗时数秒，适合"只改了代码"的场景。
+#
+# 用法（在部署目录 $REMOTE_DIR 下）：
+#   docker build -f deploy/Dockerfile.hotfix -t wb-single:latest .
+#
+# 注意：依赖（requirements.txt）有变更时必须用 deploy/Dockerfile 完整重建。
+
+FROM wb-single:latest
+
+COPY wb-manager/app /app/app
+COPY wb-manager/static /app/static
+COPY wb-rotator/rotator.py /app/rotator.py
+COPY deploy/entrypoint.py /app/entrypoint.py
+COPY deploy/healthcheck.py /app/healthcheck.py

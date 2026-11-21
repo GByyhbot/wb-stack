@@ -1,0 +1,14 @@
+[Unit]
+Description=WorkBuddy Account Rotator Proxy (OpenAI-compatible)
+After=network-online.target
+
+[Service]
+Type=simple
+User=Yyh154019
+WorkingDirectory=/vol1/1000/apps/wb-rotator
+ExecStart=/usr/bin/python3 /vol1/1000/apps/wb-rotator/rotator.py serve --host 0.0.0.0 --port 8310
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

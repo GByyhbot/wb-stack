@@ -1,0 +1,24 @@
+# 构建上下文白名单之外的敏感/无用文件一律排除
+.workbuddy/**
+.git/**
+**/__pycache__/**
+**/*.pyc
+**/*.db
+wb-manager/data/**
+wb-manager/cli.py
+wb-manager/README.md
+wb-rotator/accounts.json
+wb-rotator/pin.json
+wb-rotator/model_state.json
+wb-rotator/logs/**
+wb-rotator/snapshots/**
+wb-rotator/*.json
+wb-rotator/*.log
+wb-rotator/*.vbs
+wb-rotator/*.md
+wb-rotator/*.service
+wb-rotator/*.bak.*
+deploy/data/**
+deploy/.env
+deploy/deploy.py
+export_second_rt.bat

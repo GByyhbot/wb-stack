@@ -1,0 +1,24 @@
+# ===== 敏感数据与运行时状态（严禁入库）=====
+.workbuddy/
+deploy/.env
+wb-manager/data/
+wb-rotator/accounts.json
+wb-rotator/model_state.json
+wb-rotator/pin.json
+wb-rotator/snapshots/
+wb-rotator/logs/
+fnos_accounts_after.json
+fnos_accounts_live.json
+fnos_accounts_new.json
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ===== 编辑器与系统 =====
+.DS_Store
+Thumbs.db
+*.log
+*.bak
