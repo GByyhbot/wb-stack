@@ -726,22 +726,25 @@ def _circuit_entry(st, key):
 
 
 def _record_circuit_fail(name, model):
-    """记录一次 network/5xx 失败；达阈值打开熔断，半开试探失败则重开"""
+    """记录一次 network/5xx 失败；达阈值打开熔断，半开试探失败则重开。
+
+    半开判定（修复）：试探失败重开仅适用于两种情形——条目 half_open 已为 True，
+    或 open_until>0 且已过期（冷却到期后的那次请求即试探）。
+    从未打开的条目（open_until=0）不得走试探分支，只累加 fails，达阈值才打开。"""
     with _cs_lock:
         st = _load_circuit_state()
         now = time.time()
         for key in (_circuit_acc_key(name), _circuit_model_key(name, model)):
             e = _circuit_entry(st, key)
-            if e.get("open_until", 0) <= now:
-                # 冷却已过：重置为半开试探
-                e["half_open"] = True
-                e["fails"] = 0
-            if e.get("half_open"):
-                # 试探失败：重新打开熔断
+            open_until = e.get("open_until", 0)
+            cooldown_elapsed = open_until > 0 and open_until <= now
+            if e.get("half_open") or cooldown_elapsed:
+                # 试探失败（半开试探 / 冷却到期后首请求）：重新打开熔断
                 e["half_open"] = False
                 e["open_until"] = now + CIRCUIT_COOLDOWN_SECONDS
                 e["fails"] = 0
             else:
+                # 从未打开或仍在冷却：只累加 fails，达阈值才打开
                 e["fails"] = e.get("fails", 0) + 1
                 if e["fails"] >= CIRCUIT_FAIL_THRESHOLD:
                     e["open_until"] = now + CIRCUIT_COOLDOWN_SECONDS

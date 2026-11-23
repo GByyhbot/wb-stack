@@ -1031,6 +1031,24 @@ def test_circuit_fail_threshold_and_cooldown(rot):
     assert rot._circuit_model_open(name, model)
 
 
+def test_circuit_fail_below_threshold_not_open(rot):
+    """修复批负向用例：从未打开的条目只累加 fails，未达阈值不得打开。
+    第 1、2 次失败后账号级与模型级均不打开；第 3 次达阈值才打开。"""
+    name, model = "一号", "glm-5.3-flash"
+    # 第 1 次失败：两级均不打开
+    rot._record_circuit_fail(name, model)
+    assert not rot._circuit_acc_open(name)
+    assert not rot._circuit_model_open(name, model)
+    # 第 2 次失败：仍未达阈值，两级均不打开
+    rot._record_circuit_fail(name, model)
+    assert not rot._circuit_acc_open(name)
+    assert not rot._circuit_model_open(name, model)
+    # 第 3 次失败：达阈值，两级均打开
+    rot._record_circuit_fail(name, model)
+    assert rot._circuit_acc_open(name)
+    assert rot._circuit_model_open(name, model)
+
+
 def test_circuit_429_not_counted(rot):
     """修正②: 429 走 soft 冷却不计入熔断，熔断只计 network/5xx"""
     # 模拟 429：走 mark_model(soft)，不调用 _record_circuit_fail
@@ -1067,14 +1085,14 @@ def test_circuit_half_open_recovery(rot):
 
 
 def test_circuit_acc_model_independent_and_blocks(rot):
-    """账号级与模型级为独立状态：同一 network/5xx 失败驱动两级各自计数达阈值；
-    熔断打开后，模型级过滤该账号的该模型，账号级过滤该账号的所有模型"""
+    """账号级与模型级为独立状态、独立冷却：同一 network/5xx 失败同时驱动两级计数，
+    各自达阈值打开；熔断打开后，模型级过滤该账号的该模型，账号级过滤该账号的所有模型"""
     _write_pool(rot, [
         {"name": "一号", "refresh_token": "a", "priority": 1},
         {"name": "二号", "refresh_token": "b", "priority": 2},
     ])
     sessions = [rot.AccountSession("一号"), rot.AccountSession("二号")]
-    # 对一号/glm-5.3-flash 灌满阈值：模型级与账号级各自独立计数、同时达阈值打开
+    # 对一号/glm-5.3-flash 灌满阈值：同一失败同时驱动两级计数，各自达阈值打开
     for _ in range(rot.CIRCUIT_FAIL_THRESHOLD):
         rot._record_circuit_fail("一号", "glm-5.3-flash")
     assert rot._circuit_model_open("一号", "glm-5.3-flash")
