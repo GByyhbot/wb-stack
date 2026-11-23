@@ -28,8 +28,10 @@ WorkBuddy 本机多账号自动轮换代理 (wb-rotator)
   - 账号状态按「自然日」记录，跨天自动恢复，无需手动重置。
 """
 import argparse
+import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -483,12 +485,14 @@ def _sync_sessions():
                          (len(names), ", ".join(names)))
 
 
-def pick_available_session(sessions, model=None, exclude=None):
+def pick_available_session(sessions, model=None, exclude=None, sticky=None):
     """
     选一个可用账号会话（状态实时读文件）。
     P2: model 传入时做「账号×模型」级过滤——某模型当日耗尽/限流冷却中的账号被跳过，
     不整号拉黑（借鉴 icebears111/workbuddy2api 的配额感知切号）。
     手动置顶（pin.json）的账号优先选用。
+    稳定性增量（项2）：sticky 传入粘性记录账号，选号优先级 pin > 粘性 > priority 遍历；
+    usable() 增账号级/模型级熔断过滤。
     exclude: 本次请求内已试过且失败的账号名集合，不再重复选（见 _handle）。
     """
     exclude = set(exclude or ())
@@ -508,15 +512,27 @@ def pick_available_session(sessions, model=None, exclude=None):
             return False
         if model and model_blocked(s.name, model):
             return False
+        if _circuit_acc_open(s.name):
+            return False  # 账号级熔断
+        if model and _circuit_model_open(s.name, model):
+            return False  # 模型级熔断
         return True
 
-    # 置顶优先（B3: 名字先经 resolve_name 唯一解析，前缀多命中时不置顶，防串号）
+    # 1. pin 置顶优先（人工决定高于粘性启发式）
     if pinned:
         pin_name = resolve_name(pinned, [s.name for s in sessions])
         if pin_name:
             for s in sessions:
                 if s.name == pin_name and usable(s):
                     return s
+    # 2. 粘性记录：仅在 pin 未设或 pin 即记录账号时生效
+    if sticky:
+        pin_resolved = resolve_name(pinned, [s.name for s in sessions]) if pinned else None
+        if not pin_resolved or pin_resolved == sticky:
+            for s in sessions:
+                if s.name == sticky and usable(s):
+                    return s
+    # 3. priority 遍历
     for s in sessions:
         if usable(s):
             return s
@@ -574,6 +590,230 @@ def get_pinned():
         return (json.load(open(PIN_FILE, encoding="utf-8")) or {}).get("name")
     except Exception:
         return None
+
+
+# ----------------------------------------------------------------------------
+# 第一阶段·项2 稳定性增量：会话粘性 / 熔断冷却 / 并发分配锁
+# 三者均为单写者（rotator 网关进程）状态文件，沿用 model_state.json 纪律：
+# 进程内线程锁（RLock 可重入）+ tmp+replace 原子写 + 锁内读写，不引入跨进程文件锁。
+# ----------------------------------------------------------------------------
+
+# A. 会话粘性：同键优先复用上次账号，降低同会话反复切号的抖动。
+#    粘性键三级提取：user 字段 → IP+UA 指纹 → X-Session-Id；皆无则退化现行选号。
+SESSION_STATE_FILE = os.path.join(HERE, "session_state.json")
+STICKY_TTL_SECONDS = 86400      # 粘性映射 24h 过期
+STICKY_MAX_ENTRIES = 1000       # 条目上限，超限先清过期
+_ss_lock = threading.RLock()
+
+
+def _sticky_key_hash(key):
+    return hashlib.sha1(("sticky|" + key).encode("utf-8")).hexdigest()[:24]
+
+
+def _load_session_state():
+    """加载粘性映射，惰性清理过期条目（TTL 外、非 dict 值均丢弃）"""
+    with _ss_lock:
+        try:
+            with open(SESSION_STATE_FILE, "r", encoding="utf-8") as f:
+                st = json.load(f)
+        except Exception:
+            return {}
+        if not isinstance(st, dict):
+            return {}
+        now = time.time()
+        out = {k: v for k, v in st.items()
+               if isinstance(v, dict) and now - v.get("ts", 0) <= STICKY_TTL_SECONDS}
+        if len(out) > STICKY_MAX_ENTRIES:
+            out = dict(sorted(out.items(), key=lambda kv: kv[1].get("ts", 0),
+                              reverse=True)[:STICKY_MAX_ENTRIES])
+        return out
+
+
+def _get_sticky_account(key):
+    """按粘性键取记录账号；无键或无记录返回 None"""
+    if not key:
+        return None
+    st = _load_session_state()
+    rec = st.get(_sticky_key_hash(key))
+    if not rec:
+        return None
+    acc = rec.get("account")
+    return acc if isinstance(acc, str) and acc else None
+
+
+def _save_sticky(key, account):
+    """回写粘性映射（先清过期，原子写）；仅键或账号变化时由调用方触发"""
+    if not key or not account:
+        return
+    st = _load_session_state()
+    if len(st) >= STICKY_MAX_ENTRIES:
+        st = {k: v for k, v in st.items()
+              if time.time() - v.get("ts", 0) <= STICKY_TTL_SECONDS}
+    st[_sticky_key_hash(key)] = {"account": account, "ts": time.time()}
+    tmp = SESSION_STATE_FILE + ".tmp"
+    with _ss_lock:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, SESSION_STATE_FILE)
+
+
+def _extract_sticky_key(handler, req_body):
+    """三级粘性键提取，取到即用不再向下探；皆无返回 None（退化现行选号）"""
+    # 1. user 字段（Responses 标准字段，其它协议客户端传了也认）
+    u = (req_body.get("user") or "").strip()
+    if u and len(u) <= 64 and re.fullmatch(r"[A-Za-z0-9_-]+", u):
+        return u
+    # 2. IP+UA 指纹（不存原文，sha1 截断，兼顾隐私与定长）
+    ip = ""
+    try:
+        ip = handler.client_address[0] if handler.client_address else ""
+    except Exception:
+        ip = ""
+    ua = (handler.headers.get("User-Agent") or "").strip()
+    if ip and ua:
+        return "ipua:" + hashlib.sha1(
+            ("%s|%s" % (ip, ua)).encode("utf-8")).hexdigest()[:16]
+    # 3. X-Session-Id
+    sid = (handler.headers.get("X-Session-Id") or "").strip()
+    if sid and len(sid) <= 128:
+        return sid
+    return None
+
+
+# B. 熔断：账号级与模型级独立计数、独立熔断。
+#    计数口径（修正②）：只计 network 类与 5xx；429 已走 soft 冷却不计入；
+#    402/auth 属额度/鉴权语义，走 mark_exhausted/mark_model，不计入熔断。
+CIRCUIT_STATE_FILE = os.path.join(HERE, "circuit_state.json")
+CIRCUIT_FAIL_THRESHOLD = 3       # 连续 network/5xx 失败阈值
+CIRCUIT_COOLDOWN_SECONDS = 300   # 熔断冷却时长
+_cs_lock = threading.RLock()
+
+
+def _circuit_acc_key(name):
+    return "acc|" + name
+
+
+def _circuit_model_key(name, model):
+    return "acc|%s|m|%s" % (name, model)
+
+
+def _load_circuit_state():
+    with _cs_lock:
+        try:
+            with open(CIRCUIT_STATE_FILE, "r", encoding="utf-8") as f:
+                st = json.load(f)
+        except Exception:
+            return {}
+        return st if isinstance(st, dict) else {}
+
+
+def _save_circuit_state(st):
+    tmp = CIRCUIT_STATE_FILE + ".tmp"
+    with _cs_lock:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, CIRCUIT_STATE_FILE)
+
+
+def _circuit_entry(st, key):
+    e = st.get(key)
+    if not isinstance(e, dict):
+        e = {}
+    e.setdefault("fails", 0)
+    e.setdefault("open_until", 0)
+    e.setdefault("half_open", False)
+    return e
+
+
+def _record_circuit_fail(name, model):
+    """记录一次 network/5xx 失败；达阈值打开熔断，半开试探失败则重开"""
+    with _cs_lock:
+        st = _load_circuit_state()
+        now = time.time()
+        for key in (_circuit_acc_key(name), _circuit_model_key(name, model)):
+            e = _circuit_entry(st, key)
+            if e.get("open_until", 0) <= now:
+                # 冷却已过：重置为半开试探
+                e["half_open"] = True
+                e["fails"] = 0
+            if e.get("half_open"):
+                # 试探失败：重新打开熔断
+                e["half_open"] = False
+                e["open_until"] = now + CIRCUIT_COOLDOWN_SECONDS
+                e["fails"] = 0
+            else:
+                e["fails"] = e.get("fails", 0) + 1
+                if e["fails"] >= CIRCUIT_FAIL_THRESHOLD:
+                    e["open_until"] = now + CIRCUIT_COOLDOWN_SECONDS
+                    e["half_open"] = False
+            st[key] = e
+        _save_circuit_state(st)
+
+
+def _record_circuit_success(name, model):
+    """试探成功：清零该账号/模型熔断记录；无记录则不写，避免频繁落盘"""
+    with _cs_lock:
+        st = _load_circuit_state()
+        ak, mk = _circuit_acc_key(name), _circuit_model_key(name, model)
+        if ak not in st and mk not in st:
+            return
+        st.pop(ak, None)
+        st.pop(mk, None)
+        _save_circuit_state(st)
+
+
+def _circuit_acc_open(name):
+    st = _load_circuit_state()
+    e = st.get(_circuit_acc_key(name))
+    return bool(e and e.get("open_until", 0) > time.time())
+
+
+def _circuit_model_open(name, model):
+    st = _load_circuit_state()
+    e = st.get(_circuit_model_key(name, model))
+    return bool(e and e.get("open_until", 0) > time.time())
+
+
+# C. 并发分配锁：选号与占用原子化，防并发请求撞同号。
+#    _inuse 为进程内内存登记，_inuse_lock 保护；请求结束必须释放（try/finally 兜底）。
+_inuse = {}            # {账号名: 占用计数}
+_inuse_lock = threading.Lock()
+
+
+def pick_and_reserve(sessions, model=None, exclude=None, sticky=None):
+    """在 pick_available_session 之上做占用登记：选号+占用原子完成。
+    sticky: 粘性记录账号，经 pick_available_session 参与优先级（pin > 粘性）。
+    全部账号均被占用时，接受共用一个未禁用账号（请求终会完成并释放），避免死锁。"""
+    with _inuse_lock:
+        tried_local = list(exclude or ())
+        last = None
+        for _ in range(len(sessions) + 1):
+            s = pick_available_session(sessions, model, exclude=tried_local,
+                                       sticky=sticky)
+            if s is None:
+                break  # 无可用账号：跳出走兜底，不直接返回
+            last = s
+            if _inuse.get(s.name, 0) > 0:
+                tried_local.append(s.name)
+                continue
+            _inuse[s.name] = _inuse.get(s.name, 0) + 1
+            return s
+        # 兜底：无可用账号，或全部被占用——接受共用 last（请求终会完成并释放），避免死锁
+        if last is not None:
+            _inuse[last.name] = _inuse.get(last.name, 0) + 1
+            return last
+        return None
+
+
+def release_reservation(name):
+    """释放占用计数，归零即删"""
+    if not name:
+        return
+    with _inuse_lock:
+        if name in _inuse:
+            _inuse[name] -= 1
+            if _inuse[name] <= 0:
+                del _inuse[name]
 
 
 def _name_match(a, b):
@@ -1481,92 +1721,122 @@ def _handle(self, req_body):
     payload = json.dumps(req_body).encode("utf-8")
     want_stream = bool(getattr(self, "_client_stream", False))
 
-    tried = []
-    for _ in range(MAX_SWITCH_RETRY):
-        session = pick_available_session(self.sessions, self._ctx["model"], exclude=tried)
-        if session is None:
-            self._err(503, "所有账号今日额度已耗尽（已尝试: %s）。明日自动恢复，或执行 reset。"
-                      % (", ".join(tried) or "无可用账号"),
-                      "all_accounts_exhausted")
-            return
-        tried.append(session.name)
-        self._ctx["account"] = session.name
-        try:
-            at = session.get_access_token()
-        except TokenAuthError as e:
-            # 令牌确已失效：标记耗尽（等人工更新令牌后 reset/check 恢复）
-            sys.stderr.write("⚠️ %s，跳过该账号并标记耗尽\n" % e)
-            mark_exhausted(session.name)
-            continue
-        except TokenNetworkError as e:
-            # B4: 网络抖动只跳过本次请求，不把健康账号下线一整天。
-            # 该账号名已在选号时记入 tried 并经 exclude 传回选号器，
-            # 本次请求内不会再撞它（避免单账号池对着超时接口连撞数次才返回）。
-            sys.stderr.write("⚠️ %s，本次跳过（不标记耗尽）\n" % e)
-            continue
-        except RuntimeError as e:
-            sys.stderr.write("⚠️ %s，跳过该账号\n" % e)
-            mark_exhausted(session.name)
-            continue
-        try:
-            resp = forward_stream(at, payload)
-        except urllib.error.HTTPError as e:
-            err_text = ""
-            try:
-                err_text = e.read().decode("utf-8", "replace")
-            except Exception:
-                pass
-            if is_exhausted_response(e.code, err_text):
-                cur = session.current() or {}
-                if e.code == 429:
-                    # P2 限流：只对（账号×模型）软冷却，本次请求切下一账号
-                    mark_model(session.name, self._ctx["model"], "soft")
-                    sys.stderr.write("⏳ %s/%s 限流，软冷却 %ds，切下一账号\n"
-                                     % (session.name, self._ctx["model"], SOFT_COOLDOWN_SECONDS))
-                    continue
-                # 402/额度类错误：区分账号级（积分耗尽）与模型级（模型日额度耗尽）
-                ok_c, credits, _ = query_credits(cur.get("refresh_token", ""))
-                if ok_c and credits is not None and credits <= 0:
-                    mark_exhausted(session.name)
-                    sys.stderr.write("🔁 %s 可用积分耗尽（余额0确认），整号切换\n" % session.name)
-                    continue
-                if ok_c and credits is not None:
-                    # 积分充足 → 是模型级日额度问题：仅标记该模型，不误伤同号其它模型
-                    mark_model(session.name, self._ctx["model"], "hard")
-                    sys.stderr.write("🔁 %s/%s 模型当日额度耗尽（积分尚余 %s），仅切该模型\n"
-                                     % (session.name, self._ctx["model"], credits))
-                    continue
-                sys.stderr.write("⚠️ %s 返回 %s 但余额查询失败，保守返回错误\n" % (session.name, e.code))
-            self._err(e.code, err_text[:500] or ("HTTP %s" % e.code))
-            return
-        except Exception as e:
-            # 网络层瞬断（如大请求体 TLS EOF）：未向客户端输出任何内容，安全重试下一账号
-            sys.stderr.write("⚠️ %s 网络错误: %s，自动重试下一账号\n" % (session.name, str(e)[:120]))
-            self._last_net_err = str(e)[:200]
-            continue
+    # 稳定性增量（项2）：提取粘性键，查粘性记录账号（三级键皆无则 None，退化现行选号）
+    sticky_key = _extract_sticky_key(self, req_body)
+    sticky_account = _get_sticky_account(sticky_key)
 
-        fmt = getattr(self, "_fmt", "chat")
-        if want_stream:
-            if fmt == "chat":
-                self._stream_response(resp)
-            else:
-                self._stream_response_translated(resp, fmt)
-        else:
-            try:
-                result = aggregate_stream(resp)
-            except Exception as e:
-                self._err(502, "读取上游响应失败: %s" % str(e)[:150])
+    tried = []
+    cur_reserved = None  # 当前占用账号，try/finally 兜底释放（修正①）
+    try:
+        for _ in range(MAX_SWITCH_RETRY):
+            # 切换账号前先释放上一个占用
+            if cur_reserved:
+                release_reservation(cur_reserved)
+                cur_reserved = None
+            session = pick_and_reserve(self.sessions, self._ctx["model"],
+                                       exclude=tried, sticky=sticky_account)
+            if session is None:
+                self._err(503, "所有账号今日额度已耗尽（已尝试: %s）。明日自动恢复，或执行 reset。"
+                          % (", ".join(tried) or "无可用账号"),
+                          "all_accounts_exhausted")
                 return
-            if fmt == "messages":
-                self._json(200, chat_to_anthropic(result, self._ctx["model"]),
-                           log_obj=result)
-            elif fmt == "responses":
-                self._json(200, chat_to_responses(result, self._ctx["model"]),
-                           log_obj=result)
+            cur_reserved = session.name
+            # 粘性记录回写：仅账号变化时写，稳定会话不重复落盘
+            if sticky_key and sticky_account != session.name:
+                _save_sticky(sticky_key, session.name)
+                sticky_account = session.name
+            tried.append(session.name)
+            self._ctx["account"] = session.name
+            try:
+                at = session.get_access_token()
+            except TokenAuthError as e:
+                # 令牌确已失效：标记耗尽（等人工更新令牌后 reset/check 恢复）
+                sys.stderr.write("⚠️ %s，跳过该账号并标记耗尽\n" % e)
+                mark_exhausted(session.name)
+                continue
+            except TokenNetworkError as e:
+                # B4: 网络抖动只跳过本次请求，不把健康账号下线一整天。
+                # 该账号名已在选号时记入 tried 并经 exclude 传回选号器，
+                # 本次请求内不会再撞它（避免单账号池对着超时接口连撞数次才返回）。
+                # 项2: 网络类失败计入熔断计数（修正②）。
+                sys.stderr.write("⚠️ %s，本次跳过（不标记耗尽）\n" % e)
+                _record_circuit_fail(session.name, self._ctx["model"])
+                continue
+            except RuntimeError as e:
+                sys.stderr.write("⚠️ %s，跳过该账号\n" % e)
+                mark_exhausted(session.name)
+                continue
+            try:
+                resp = forward_stream(at, payload)
+            except urllib.error.HTTPError as e:
+                err_text = ""
+                try:
+                    err_text = e.read().decode("utf-8", "replace")
+                except Exception:
+                    pass
+                if is_exhausted_response(e.code, err_text):
+                    cur = session.current() or {}
+                    if e.code == 429:
+                        # P2 限流：只对（账号×模型）软冷却，本次请求切下一账号
+                        # 项2: 429 已走 soft 冷却，不计入熔断计数（避免双重处罚）
+                        mark_model(session.name, self._ctx["model"], "soft")
+                        sys.stderr.write("⏳ %s/%s 限流，软冷却 %ds，切下一账号\n"
+                                         % (session.name, self._ctx["model"], SOFT_COOLDOWN_SECONDS))
+                        continue
+                    # 402/额度类错误：区分账号级（积分耗尽）与模型级（模型日额度耗尽）
+                    ok_c, credits, _ = query_credits(cur.get("refresh_token", ""))
+                    if ok_c and credits is not None and credits <= 0:
+                        mark_exhausted(session.name)
+                        sys.stderr.write("🔁 %s 可用积分耗尽（余额0确认），整号切换\n" % session.name)
+                        continue
+                    if ok_c and credits is not None:
+                        # 积分充足 → 是模型级日额度问题：仅标记该模型，不误伤同号其它模型
+                        mark_model(session.name, self._ctx["model"], "hard")
+                        sys.stderr.write("🔁 %s/%s 模型当日额度耗尽（积分尚余 %s），仅切该模型\n"
+                                         % (session.name, self._ctx["model"], credits))
+                        continue
+                    sys.stderr.write("⚠️ %s 返回 %s 但余额查询失败，保守返回错误\n" % (session.name, e.code))
+                elif e.code >= 500:
+                    # 项2: 5xx（非额度类）计入熔断计数
+                    _record_circuit_fail(session.name, self._ctx["model"])
+                self._err(e.code, err_text[:500] or ("HTTP %s" % e.code))
+                return
+            except Exception as e:
+                # 网络层瞬断（如大请求体 TLS EOF）：未向客户端输出任何内容，安全重试下一账号
+                # 项2: 网络类失败计入熔断计数（修正②）
+                sys.stderr.write("⚠️ %s 网络错误: %s，自动重试下一账号\n" % (session.name, str(e)[:120]))
+                self._last_net_err = str(e)[:200]
+                _record_circuit_fail(session.name, self._ctx["model"])
+                continue
+
+            fmt = getattr(self, "_fmt", "chat")
+            if want_stream:
+                if fmt == "chat":
+                    self._stream_response(resp)
+                else:
+                    self._stream_response_translated(resp, fmt)
             else:
-                result["rotator"] = {"account": session.name}
-                self._json(200, result)
-        return
+                try:
+                    result = aggregate_stream(resp)
+                except Exception as e:
+                    self._err(502, "读取上游响应失败: %s" % str(e)[:150])
+                    return
+                if fmt == "messages":
+                    self._json(200, chat_to_anthropic(result, self._ctx["model"]),
+                               log_obj=result)
+                elif fmt == "responses":
+                    self._json(200, chat_to_responses(result, self._ctx["model"]),
+                               log_obj=result)
+                else:
+                    result["rotator"] = {"account": session.name}
+                    self._json(200, result)
+            # 项2: 成功则清零该账号/模型熔断记录（试探成功恢复）
+            _record_circuit_success(session.name, self._ctx["model"])
+            return
+    finally:
+        # 修正①: 任何退出路径（成功/失败/异常/切换/耗尽）都兜底释放占用，不漏放 _inuse 计数
+        if cur_reserved:
+            release_reservation(cur_reserved)
 
     self._err(503, "连续切换 %d 个账号仍失败（已尝试: %s%s）" % (
         MAX_SWITCH_RETRY, ", ".join(tried),

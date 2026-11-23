@@ -931,3 +931,214 @@ def test_load_model_routes_no_env_keeps_defaults(rot, monkeypatch):
     monkeypatch.delenv("WB_MODEL_ROUTES", raising=False)
     routes = rot._load_model_routes()
     assert routes == rot._DEFAULT_MODEL_ROUTES
+
+
+# ---- 第一阶段·项2：网关稳定性增量（粘性 / 熔断 / 占用锁） ----
+
+@pytest.fixture(autouse=True)
+def _clean_stability_state(rot):
+    """批次3 状态隔离：每个测试前后清理粘性/熔断状态文件与占用登记，
+    避免用例间状态残留污染（仅清新增状态，不影响 accounts/model_state）。"""
+    def _clean():
+        rot._inuse.clear()
+        for fp in (rot.SESSION_STATE_FILE, rot.CIRCUIT_STATE_FILE):
+            if os.path.exists(fp):
+                os.remove(fp)
+    _clean()
+    yield
+    _clean()
+
+
+def test_extract_sticky_key_three_levels(rot):
+    """粘性键三级提取：user 字段优先，其次 IP+UA，再次 X-Session-Id"""
+    fake = _FakeHandler()
+    fake.client_address = ("1.2.3.4", 1234)
+    fake.headers = {"User-Agent": "UA-test", "X-Session-Id": "sid-1"}
+    # 1. user 字段优先
+    assert rot._extract_sticky_key(fake, {"user": "user-abc"}) == "user-abc"
+    # 2. 无 user → IP+UA 指纹
+    k = rot._extract_sticky_key(fake, {})
+    assert k.startswith("ipua:")
+    # 3. 无 IP/UA → X-Session-Id
+    fake2 = _FakeHandler()
+    fake2.client_address = None
+    fake2.headers = {"X-Session-Id": "sid-1"}
+    assert rot._extract_sticky_key(fake2, {}) == "sid-1"
+
+
+def test_extract_sticky_key_none(rot):
+    """三级键皆无可用值 → None，退化现行选号（修正③）；非法 user 视同无值"""
+    fake = _FakeHandler()
+    fake.client_address = None
+    fake.headers = {}
+    assert rot._extract_sticky_key(fake, {}) is None
+    fake2 = _FakeHandler()
+    fake2.client_address = None
+    fake2.headers = {}
+    assert rot._extract_sticky_key(fake2, {"user": "非法 空格!"}) is None
+
+
+def test_sticky_account_preferred(rot):
+    """粘性记录账号优先于 priority 遍历（pin 未设时）"""
+    _write_pool(rot, [
+        {"name": "一号", "refresh_token": "a", "priority": 1},
+        {"name": "二号", "refresh_token": "b", "priority": 2},
+    ])
+    sessions = [rot.AccountSession("一号"), rot.AccountSession("二号")]
+    # 无粘性时按 priority 选一号
+    assert rot.pick_available_session(sessions).name == "一号"
+    # 粘性记录指向二号 → 优先二号
+    assert rot.pick_available_session(sessions, sticky="二号").name == "二号"
+
+
+def test_sticky_pin_overrides_sticky(rot):
+    """修正②: pin（人工）高于粘性（启发式）；记录账号与 pin 不一致时以 pin 为准"""
+    _write_pool(rot, [
+        {"name": "一号", "refresh_token": "a", "priority": 1},
+        {"name": "二号", "refresh_token": "b", "priority": 2},
+    ])
+    with open(rot.PIN_FILE, "w", encoding="utf-8") as f:
+        json.dump({"name": "一号"}, f)
+    sessions = [rot.AccountSession("一号"), rot.AccountSession("二号")]
+    # pin=一号，粘性记录=二号 → 以 pin 为准，选一号
+    assert rot.pick_available_session(sessions, sticky="二号").name == "一号"
+    # pin 未设时粘性生效
+    os.remove(rot.PIN_FILE)
+    assert rot.pick_available_session(sessions, sticky="二号").name == "二号"
+
+
+def test_sticky_ttl_expired_cleanup(rot):
+    """粘性映射 TTL 过期后惰性清理，不返回过期账号"""
+    rot._save_sticky("k1", "一号")
+    st = rot._load_session_state()
+    assert any(v.get("account") == "一号" for v in st.values())
+    # 把 ts 改到 TTL 外，模拟过期
+    st = rot._load_session_state()
+    for v in st.values():
+        v["ts"] = rot.time.time() - rot.STICKY_TTL_SECONDS - 1
+    with open(rot.SESSION_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False)
+    assert rot._load_session_state() == {}
+    assert rot._get_sticky_account("k1") is None
+
+
+def test_circuit_fail_threshold_and_cooldown(rot):
+    """连续 network/5xx 失败达阈值打开熔断，冷却期内账号/模型不可用"""
+    name, model = "一号", "glm-5.3-flash"
+    for _ in range(rot.CIRCUIT_FAIL_THRESHOLD):
+        rot._record_circuit_fail(name, model)
+    assert rot._circuit_acc_open(name)
+    assert rot._circuit_model_open(name, model)
+
+
+def test_circuit_429_not_counted(rot):
+    """修正②: 429 走 soft 冷却不计入熔断，熔断只计 network/5xx"""
+    # 模拟 429：走 mark_model(soft)，不调用 _record_circuit_fail
+    for _ in range(10):
+        rot.mark_model("一号", "glm-5.3-flash", "soft")
+    # 多次 429（soft）熔断仍不打开
+    assert not rot._circuit_acc_open("一号")
+    assert not rot._circuit_model_open("一号", "glm-5.3-flash")
+
+
+def test_circuit_half_open_recovery(rot):
+    """半开试探：成功清零，失败重开"""
+    name, model = "一号", "glm-5.3-flash"
+    # 达阈值熔断
+    for _ in range(rot.CIRCUIT_FAIL_THRESHOLD):
+        rot._record_circuit_fail(name, model)
+    assert rot._circuit_acc_open(name)
+    # 试探成功 → 清零
+    rot._record_circuit_success(name, model)
+    assert not rot._circuit_acc_open(name)
+    assert not rot._circuit_model_open(name, model)
+    # 再达阈值熔断，置半开，试探失败 → 重开
+    for _ in range(rot.CIRCUIT_FAIL_THRESHOLD):
+        rot._record_circuit_fail(name, model)
+    with open(rot.CIRCUIT_STATE_FILE, encoding="utf-8") as f:
+        st = json.load(f)
+    for v in st.values():
+        v["open_until"] = 0
+        v["half_open"] = True
+    with open(rot.CIRCUIT_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False)
+    rot._record_circuit_fail(name, model)
+    assert rot._circuit_acc_open(name)
+
+
+def test_circuit_acc_model_independent_and_blocks(rot):
+    """账号级与模型级为独立状态：同一 network/5xx 失败驱动两级各自计数达阈值；
+    熔断打开后，模型级过滤该账号的该模型，账号级过滤该账号的所有模型"""
+    _write_pool(rot, [
+        {"name": "一号", "refresh_token": "a", "priority": 1},
+        {"name": "二号", "refresh_token": "b", "priority": 2},
+    ])
+    sessions = [rot.AccountSession("一号"), rot.AccountSession("二号")]
+    # 对一号/glm-5.3-flash 灌满阈值：模型级与账号级各自独立计数、同时达阈值打开
+    for _ in range(rot.CIRCUIT_FAIL_THRESHOLD):
+        rot._record_circuit_fail("一号", "glm-5.3-flash")
+    assert rot._circuit_model_open("一号", "glm-5.3-flash")
+    assert rot._circuit_acc_open("一号")
+    # 模型级熔断：glm 选号过滤一号，选二号
+    assert rot.pick_available_session(sessions, model="glm-5.3-flash").name == "二号"
+    # 账号级熔断：对其它模型同样过滤一号，选二号
+    assert rot.pick_available_session(sessions, model="deepseek-v4.1-flash").name == "二号"
+
+
+def test_pick_and_reserve_and_release(rot):
+    """占用登记：选号即占用，被占用账号被跳过，释放后可再选"""
+    _write_pool(rot, [
+        {"name": "一号", "refresh_token": "a", "priority": 1},
+        {"name": "二号", "refresh_token": "b", "priority": 2},
+    ])
+    sessions = [rot.AccountSession("一号"), rot.AccountSession("二号")]
+    rot._inuse.clear()
+    s = rot.pick_and_reserve(sessions)
+    assert s.name == "一号"
+    assert rot._inuse.get("一号") == 1
+    # 一号被占用 → 选二号
+    s2 = rot.pick_and_reserve(sessions)
+    assert s2.name == "二号"
+    # 释放一号后可再选
+    rot.release_reservation("一号")
+    assert rot._inuse == {"二号": 1}
+    s3 = rot.pick_and_reserve(sessions)
+    assert s3.name == "一号"
+    rot.release_reservation("二号")
+    rot.release_reservation("一号")
+    assert rot._inuse == {}
+
+
+def test_pick_and_reserve_all_inuse_no_deadlock(rot):
+    """全部账号被占用时不死锁，接受共用一个账号"""
+    _write_pool(rot, [{"name": "一号", "refresh_token": "a", "priority": 1}])
+    sessions = [rot.AccountSession("一号")]
+    rot._inuse.clear()
+    rot._inuse["一号"] = 1  # 已占用
+    # 全占用仍返回账号，不死锁
+    s = rot.pick_and_reserve(sessions)
+    assert s is not None
+    assert s.name == "一号"
+    rot._inuse.clear()
+
+
+def test_handle_releases_inuse_on_exception_path(rot, monkeypatch):
+    """修正①: _handle 异常路径（网络类失败切换耗尽）也必须兜底释放占用"""
+    _write_pool(rot, [{"name": "一号", "refresh_token": "a", "priority": 1}])
+    fake = _FakeHandler()
+    fake.headers = {"User-Agent": "UA"}
+    fake.client_address = ("1.2.3.4", 1234)
+    fake.sessions = [rot.AccountSession("一号")]
+    fake._client_stream = False
+    fake._fmt = "chat"
+    fake._err = lambda code, msg, kind=None: setattr(fake, "status", code)
+    # 令牌获取成功，转发抛网络异常 → 走 continue → 循环耗尽 → finally 释放
+    monkeypatch.setattr(fake.sessions[0], "get_access_token", lambda: "fake-token")
+
+    def boom(at, payload):
+        raise urllib.error.URLError("TLS EOF")
+    monkeypatch.setattr(rot, "forward_stream", boom)
+    rot._inuse.clear()
+    rot._handle(fake, {"model": "glm-5.3-flash", "messages": []})
+    # 异常路径退出后占用必须已释放，不漏放
+    assert rot._inuse == {}
