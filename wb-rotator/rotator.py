@@ -1118,7 +1118,8 @@ def responses_sse(resp, model, sink):
                             "name": slot["name"], "arguments": ""}})
                 if tc.get("id"):
                     slot["call_id"] = tc["id"]
-                if fn.get("name"):
+                if fn.get("name") and slot["name"] != fn["name"]:
+                    # 首片创建 slot 时已写入完整名称；此处仅拼接后续分片的增量名称
                     slot["name"] += fn["name"]
                 if fn.get("arguments"):
                     slot["args"] += fn["arguments"]

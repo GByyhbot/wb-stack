@@ -638,3 +638,221 @@ def test_panel_ui_contract():
     for marker in ('id="s_growth"', 'id="st_growth"', 'id="gwRoutes"',
                    "loadGatewayInfo()", "loadGrowthToday()", "growth_enabled"):
         assert marker in html, marker
+
+
+# --------------------------------------------------------------------------
+# 第一阶段·项1：协议回归测试补充（2026-11-23）
+# 覆盖：流式/非流式、tool_calls 拼装、错误码映射、SSE 翻译、模型路由命中与回退
+# --------------------------------------------------------------------------
+class _FakeHandler:
+    """最小 HTTP handler 替身：捕获 _json/响应头/响应体，供 _err/_stream_response 离线测试。"""
+
+    def __init__(self, fmt="chat"):
+        self._fmt = fmt
+        self._ctx = None
+        self.headers = {}
+        self.wfile = io.BytesIO()
+        self.status = None
+        self.headers_out = []
+        self.last_json = None
+
+    def _json(self, code, obj, log_obj=None):
+        self.status = code
+        self.last_json = obj
+
+    def send_response(self, code):
+        self.status = code
+
+    def send_header(self, k, v):
+        self.headers_out.append((k, v))
+
+    def end_headers(self):
+        pass
+
+
+# ---- 流式 / 非流式 ----
+def test_aggregate_stream_text_content(rot):
+    """流式文本分片聚合为非流式响应：content 拼接、finish_reason、usage 落账"""
+    chunks = [
+        {"id": "t1", "model": "glm-5.3-flash",
+         "choices": [{"delta": {"content": "你"}}]},
+        {"choices": [{"delta": {"content": "好"}}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}],
+         "usage": {"prompt_tokens": 5, "completion_tokens": 2}},
+    ]
+    out = rot.aggregate_stream(_sse_lines(chunks))
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "你好"
+    assert "tool_calls" not in msg
+    assert out["choices"][0]["finish_reason"] == "stop"
+    assert out["usage"] == {"prompt_tokens": 5, "completion_tokens": 2}
+    assert out["model"] == "glm-5.3-flash"
+    assert out["id"] == "t1"
+
+
+def test_aggregate_stream_reasoning_content(rot):
+    """reasoning_content 与 content 分别聚合，推理内容不污染正文"""
+    chunks = [
+        {"id": "r1", "choices": [{"delta": {"reasoning_content": "思考中"}}]},
+        {"choices": [{"delta": {"reasoning_content": "继续"}}]},
+        {"choices": [{"delta": {"content": "答案"}}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    out = rot.aggregate_stream(_sse_lines(chunks))
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "答案"
+    assert msg["reasoning_content"] == "思考中继续"
+
+
+def test_chat_stream_passthrough(rot):
+    """chat 流式透传：上游 SSE 字节原样下发，并从收尾帧抓 usage 记账"""
+    sse = [
+        ('data: {"id":"c1","choices":[{"delta":{"content":"你"}}]}\n').encode("utf-8"),
+        ('data: {"choices":[{"delta":{"content":"好"}}]}\n').encode("utf-8"),
+        ('data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n').encode("utf-8"),
+        b"data: [DONE]\n",
+    ]
+    fake = _FakeHandler()
+    fake._ctx = {"model": "glm-5.3-flash", "t0": 0, "account": "测试号"}
+    rot.ProxyHandler._stream_response(fake, sse)
+    assert fake.status == 200
+    assert fake.wfile.getvalue() == b"".join(sse)   # 原样透传，不改写
+
+
+# ---- tool_calls 拼装 ----
+def test_aggregate_stream_parallel_tool_calls(rot):
+    """并行 tool_calls（多 index）按序拼装，各自 id/name/arguments 独立"""
+    lines = [
+        b'data: {"id":"p1","choices":[{"delta":{"tool_calls":[{"index":0,'
+        b'"id":"c1","function":{"name":"f1","arguments":""}}]}}]}',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":1,'
+        b'"id":"c2","function":{"name":"f2","arguments":""}}]}}]}',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        b'"function":{"arguments":"{\\"a\\":1}"}}]}}]}',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":1,'
+        b'"function":{"arguments":"{\\"b\\":2}"}}]},"finish_reason":"tool_calls"}]}',
+        b"data: [DONE]",
+    ]
+    out = rot.aggregate_stream(lines)
+    tcs = out["choices"][0]["message"]["tool_calls"]
+    assert [tc["id"] for tc in tcs] == ["c1", "c2"]
+    assert tcs[0]["function"]["name"] == "f1"
+    assert tcs[1]["function"]["name"] == "f2"
+    assert json.loads(tcs[0]["function"]["arguments"]) == {"a": 1}
+    assert json.loads(tcs[1]["function"]["arguments"]) == {"b": 2}
+    assert out["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_anthropic_to_chat_tool_choice_variants(rot):
+    """Anthropic tool_choice 映射：auto→auto、any→required、none 剔除工具"""
+    body = {"model": "claude-sonnet-4-5", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}]}
+    body["tool_choice"] = {"type": "auto"}
+    assert rot.anthropic_to_chat(body)["tool_choice"] == "auto"
+    body["tool_choice"] = {"type": "any"}
+    assert rot.anthropic_to_chat(body)["tool_choice"] == "required"
+
+
+# ---- 错误码映射 ----
+def test_is_exhausted_response_mapping(rot):
+    """错误码映射：402/429 直接判耗尽；关键词命中且>=400 判耗尽；无关键词/2xx 不判"""
+    assert rot.is_exhausted_response(402, "") is True
+    assert rot.is_exhausted_response(429, "") is True
+    assert rot.is_exhausted_response(400, "insufficient quota") is True
+    assert rot.is_exhausted_response(400, "余额不足") is True
+    assert rot.is_exhausted_response(500, "credit error") is True    # 关键词命中且>=400
+    assert rot.is_exhausted_response(500, "server crash") is False   # 无关键词
+    assert rot.is_exhausted_response(400, "unrelated error") is False
+    assert rot.is_exhausted_response(200, "credit") is False         # 2xx 不判
+
+
+def test_err_shape_per_protocol(rot):
+    """错误响应形状按协议：chat/responses 用 OpenAI 形态，messages 用 Anthropic 形态"""
+    chat = _FakeHandler(fmt="chat")
+    rot.ProxyHandler._err(chat, 503, "所有账号今日额度已耗尽", "all_accounts_exhausted")
+    assert chat.status == 503
+    assert chat.last_json["error"]["message"] == "所有账号今日额度已耗尽"
+    assert chat.last_json["error"]["type"] == "all_accounts_exhausted"
+
+    msgs = _FakeHandler(fmt="messages")
+    rot.ProxyHandler._err(msgs, 400, "bad request", "invalid_request_error")
+    assert msgs.status == 400
+    assert msgs.last_json["type"] == "error"
+    assert msgs.last_json["error"]["type"] == "invalid_request_error"
+    assert msgs.last_json["error"]["message"] == "bad request"
+
+
+def test_require_auth_401_shape(rot, monkeypatch):
+    """未授权：401 + OpenAI 错误形态；x-api-key 与 Bearer 均可通过"""
+    monkeypatch.setattr(rot, "AUTH_KEY", "secret-key")
+    fake = _FakeHandler()
+    assert rot._require_auth(fake) is False
+    assert fake.status == 401
+    assert fake.last_json == {"error": {"message": "unauthorized"}}
+
+    fake.headers = {"Authorization": "Bearer secret-key"}
+    assert rot._require_auth(fake) is True
+    fake.headers = {"x-api-key": "secret-key"}
+    assert rot._require_auth(fake) is True
+
+
+# ---- SSE 翻译 ----
+def test_anthropic_sse_tool_use_stream(rot):
+    """Anthropic 流式 tool_use：input_json_delta 拼装与 stop_reason=tool_use"""
+    chunks = [
+        {"id": "s1", "choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "t1",
+             "function": {"name": "f", "arguments": "{\"a\":"}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": "1}"}}]},
+            "finish_reason": "tool_calls"}]},
+        {"choices": [], "usage": {"prompt_tokens": 4, "completion_tokens": 6}},
+    ]
+    sink = {}
+    raw = b"".join(rot.anthropic_sse(_sse_lines(chunks), "glm-5.3-flash", sink))
+    text = raw.decode("utf-8")
+    assert '"partial_json": "{\\"a\\":"' in text
+    assert '"partial_json": "1}"' in text
+    assert '"stop_reason": "tool_use"' in text
+    assert sink["usage"]["completion_tokens"] == 6
+
+
+def test_responses_sse_function_call_stream(rot):
+    """Responses 流式函数调用：function_call 增量与 completed 终态对象"""
+    chunks = [
+        {"id": "s2", "choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1",
+             "function": {"name": "f", "arguments": "{\"x\":"}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": "2}"}}]},
+            "finish_reason": "tool_calls"}]},
+        {"choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 4}},
+    ]
+    sink = {}
+    raw = b"".join(rot.responses_sse(_sse_lines(chunks), "glm-5.3-flash", sink))
+    text = raw.decode("utf-8")
+    assert "response.function_call_arguments.delta" in text
+    assert "response.function_call_arguments.done" in text
+    done = [l[6:] for l in text.splitlines()
+            if l.startswith("data: ") and "response.completed" in l]
+    final = json.loads(done[0])["response"]
+    assert final["status"] == "completed"
+    fc = [it for it in final["output"] if it["type"] == "function_call"][0]
+    assert fc["call_id"] == "c1" and fc["name"] == "f"
+    assert fc["arguments"] == "{\"x\":2}"
+
+
+# ---- 模型路由命中与回退 ----
+def test_route_model_env_override_and_fallback(rot, monkeypatch):
+    """WB_MODEL_ROUTES 环境变量覆盖/增补路由；未命中档位回退保持原名"""
+    monkeypatch.setenv("WB_MODEL_ROUTES",
+                       '{"opus": "hy4free", "gpt": "deepseek-v4.1-flash"}')
+    routes = rot._load_model_routes()
+    assert routes["opus"] == "hy4free"                 # 覆盖默认
+    assert routes["gpt"] == "deepseek-v4.1-flash"      # 增补新键
+    assert routes["sonnet"] == "glm-5.3-flash"         # 未覆盖者保留默认
+    # 回退：普通模型名与空值不命中任何档位，route_model 返回 None（保持原名）
+    assert rot.route_model("glm-5.3-flash") is None
+    assert rot.route_model("unknown-model") is None
+    assert rot.route_model("") is None
