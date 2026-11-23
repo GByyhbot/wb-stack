@@ -140,17 +140,36 @@ _DEFAULT_MODEL_ROUTES = {
 
 
 def _load_model_routes():
+    """加载模型路由：默认档位 + WB_MODEL_ROUTES 环境变量覆盖/增补。
+    配置非法时抛 RuntimeError 拒绝加载（fail-fast），不静默回退到默认路由。"""
     routes = dict(_DEFAULT_MODEL_ROUTES)
     raw = os.environ.get("WB_MODEL_ROUTES", "")
     if raw:
         try:
             extra = json.loads(raw)
-            if isinstance(extra, dict):
-                for k, v in extra.items():
-                    if isinstance(k, str) and isinstance(v, str):
-                        routes[k.strip().lower()] = v.strip()
-        except Exception:
-            pass
+        except (ValueError, TypeError) as e:
+            raise RuntimeError(
+                "WB_MODEL_ROUTES 不是合法 JSON：%s（原始值前 200 字符：%r）"
+                % (e, raw[:200]))
+        if not isinstance(extra, dict):
+            raise RuntimeError(
+                "WB_MODEL_ROUTES 必须是 JSON 对象，实际为 %s"
+                % type(extra).__name__)
+        for k, v in extra.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise RuntimeError(
+                    "WB_MODEL_ROUTES 的键和值都必须是字符串，存在非法条目：%r -> %r"
+                    % (k, v))
+            key = k.strip().lower()
+            val = v.strip()
+            if not val:
+                raise RuntimeError(
+                    "WB_MODEL_ROUTES 的值不能为空：%r -> %r" % (k, v))
+            if val not in MODEL_WHITELIST:
+                raise RuntimeError(
+                    "WB_MODEL_ROUTES 目标模型 %r 不在白名单 %s 内"
+                    % (val, sorted(MODEL_WHITELIST)))
+            routes[key] = val
     return routes
 
 

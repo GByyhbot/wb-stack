@@ -856,3 +856,78 @@ def test_route_model_env_override_and_fallback(rot, monkeypatch):
     assert rot.route_model("glm-5.3-flash") is None
     assert rot.route_model("unknown-model") is None
     assert rot.route_model("") is None
+
+
+# ---- 第一阶段·项3：路由配置校验（fail-fast） ----
+
+def test_load_model_routes_invalid_json_fail_fast(rot, monkeypatch):
+    """WB_MODEL_ROUTES 为非法 JSON：抛 RuntimeError 拒绝加载，不静默回退"""
+    monkeypatch.setenv("WB_MODEL_ROUTES", "{not a json")
+    try:
+        rot._load_model_routes()
+    except RuntimeError as e:
+        assert "JSON" in str(e)
+    else:
+        raise AssertionError("非法 JSON 应抛 RuntimeError，实际静默回退了")
+
+
+def test_load_model_routes_non_dict_fail_fast(rot, monkeypatch):
+    """WB_MODEL_ROUTES 解析后非 dict（数组/标量）：抛 RuntimeError"""
+    monkeypatch.setenv("WB_MODEL_ROUTES", '["opus", "sonnet"]')
+    try:
+        rot._load_model_routes()
+    except RuntimeError as e:
+        assert "JSON 对象" in str(e)
+    else:
+        raise AssertionError("非 dict 配置应抛 RuntimeError，实际静默回退了")
+
+
+def test_load_model_routes_non_string_kv_fail_fast(rot, monkeypatch):
+    """键或值非字符串：抛 RuntimeError"""
+    monkeypatch.setenv("WB_MODEL_ROUTES", '{"opus": 123}')
+    try:
+        rot._load_model_routes()
+    except RuntimeError as e:
+        assert "字符串" in str(e)
+    else:
+        raise AssertionError("值非字符串应抛 RuntimeError，实际静默回退了")
+
+
+def test_load_model_routes_empty_value_fail_fast(rot, monkeypatch):
+    """路由值为空字符串：抛 RuntimeError"""
+    monkeypatch.setenv("WB_MODEL_ROUTES", '{"opus": ""}')
+    try:
+        rot._load_model_routes()
+    except RuntimeError as e:
+        assert "不能为空" in str(e)
+    else:
+        raise AssertionError("空值应抛 RuntimeError，实际静默回退了")
+
+
+def test_load_model_routes_target_outside_whitelist_fail_fast(rot, monkeypatch):
+    """路由目标不在 MODEL_WHITELIST：抛 RuntimeError"""
+    monkeypatch.setenv("WB_MODEL_ROUTES", '{"opus": "gpt-999"}')
+    try:
+        rot._load_model_routes()
+    except RuntimeError as e:
+        assert "白名单" in str(e) and "gpt-999" in str(e)
+    else:
+        raise AssertionError("白名单外目标应抛 RuntimeError，实际静默回退了")
+
+
+def test_load_model_routes_valid_config_passes(rot, monkeypatch):
+    """合法配置（覆盖+增补+默认保留）正常加载，不触发校验异常"""
+    monkeypatch.setenv("WB_MODEL_ROUTES",
+                       '{"opus": "hy4free", "gpt": "glm-5.3-flash"}')
+    routes = rot._load_model_routes()
+    assert routes["opus"] == "hy4free"
+    assert routes["gpt"] == "glm-5.3-flash"
+    assert routes["sonnet"] == "glm-5.3-flash"   # 未覆盖者保留默认
+    assert routes["haiku"] == "deepseek-v4.1-flash"
+
+
+def test_load_model_routes_no_env_keeps_defaults(rot, monkeypatch):
+    """未设置 WB_MODEL_ROUTES：返回默认路由，不触发校验"""
+    monkeypatch.delenv("WB_MODEL_ROUTES", raising=False)
+    routes = rot._load_model_routes()
+    assert routes == rot._DEFAULT_MODEL_ROUTES
