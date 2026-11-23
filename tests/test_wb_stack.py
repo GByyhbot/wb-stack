@@ -1160,3 +1160,158 @@ def test_handle_releases_inuse_on_exception_path(rot, monkeypatch):
     rot._handle(fake, {"model": "glm-5.3-flash", "messages": []})
     # 异常路径退出后占用必须已释放，不漏放
     assert rot._inuse == {}
+
+
+# --------------------------------------------------------------------------
+# 批次4 项4：备份与健康
+# --------------------------------------------------------------------------
+def test_backup_run_creates_snapshot_and_manifest(mgr, tmp_path, monkeypatch):
+    """备份：SQLite 快照 + rotator 数据原子拷贝 + manifest 行数清单"""
+    import app.backup as backup
+    # 造数据：2 账号 + 签到日志 + 设置（mgr fixture 为 module 级共享，
+    # DB 行数被前序用例累加，故断言用增量而非绝对值）
+    db = mgr["db"]
+    _base_accounts = db.list_accounts().__len__()
+    _base_logs = len(db.recent_logs(limit=1000))
+    a1 = db.add_account("主号", "u1", "tok1", priority=1)
+    a2 = db.add_account("备号", "u2", "tok2", priority=2)
+    db.add_checkin_log(a1, True, "成功", "+50")
+    db.add_checkin_log(a2, False, "失败", "")
+    db.set_setting("checkin_time", "08:30")
+    # rotator 数据文件
+    rot_home = mgr["rot_home"]
+    with open(os.path.join(rot_home, "accounts.json"), "w", encoding="utf-8") as f:
+        json.dump({"accounts": [{"name": "主号", "refresh_token": "rt1"},
+                                {"name": "备号", "refresh_token": "rt2"}]}, f)
+    backup_dir = str(tmp_path / "backup")
+    monkeypatch.setattr(backup, "BACKUP_DIR", backup_dir)
+
+    summary = backup.run_backup("test")
+    assert summary["ok"] is True
+    bdir = summary["backup_dir"]
+    assert os.path.isdir(bdir)
+    # DB 快照存在且本次增量行数正确
+    assert os.path.isfile(os.path.join(bdir, "wb_manager.db"))
+    assert summary["db_rows"]["accounts"] == _base_accounts + 2
+    assert summary["db_rows"]["checkin_logs"] == _base_logs + 2
+    assert summary["db_rows"]["settings"] >= 1
+    # rotator 数据文件已拷贝
+    assert "accounts.json" in summary["rotator_files"]
+    assert summary["accounts_count"] == 2
+    # manifest 落盘
+    manifest = json.load(open(os.path.join(bdir, "manifest.json"), encoding="utf-8"))
+    assert manifest["db"]["rows"]["accounts"] == _base_accounts + 2
+    assert manifest["accounts_count"] == 2
+    # 快照库可独立打开，内容与源一致
+    conn = sqlite3.connect(os.path.join(bdir, "wb_manager.db"))
+    rows = {t: conn.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
+            for t in ("accounts", "checkin_logs", "settings")}
+    conn.close()
+    assert rows == summary["db_rows"]
+
+
+def test_backup_retention_prunes_old(mgr, tmp_path, monkeypatch):
+    """保留策略：超出份数的旧备份被清理"""
+    import app.backup as backup
+    backup_dir = str(tmp_path / "backup")
+    os.makedirs(backup_dir)
+    # 造 3 个旧备份目录（backup.prune 按目录名排序，保留最近 KEEP_COUNT 份）
+    monkeypatch.setattr(backup, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(backup, "KEEP_COUNT", 2)
+    for i, name in enumerate(["wb-backup-20260101-000001",
+                              "wb-backup-20260102-000002",
+                              "wb-backup-20260103-000003"]):
+        os.makedirs(os.path.join(backup_dir, name))
+    pruned = backup.prune_backups()
+    # 保留最近 2 份，最旧的被删
+    assert "wb-backup-20260101-000001" in pruned
+    remaining = sorted(os.listdir(backup_dir))
+    assert remaining == ["wb-backup-20260102-000002", "wb-backup-20260103-000003"]
+
+
+def test_rotator_health_status(rot):
+    """rotator 独立健康状态：账号池概况 + 熔断概况 + 存活"""
+    _write_pool(rot, [
+        {"name": "一号", "refresh_token": "a", "priority": 1},
+        {"name": "二号", "refresh_token": "b", "priority": 2, "disabled": True},
+    ])
+    h = rot.health_status()
+    assert h["status"] == "ok"
+    assert h["process"] == "rotator"
+    assert h["accounts_total"] == 2
+    assert h["accounts_active"] == 1
+    assert h["uptime_seconds"] >= 0
+    # 熔断概况：打开中条目计数（无熔断时为 0）
+    assert h["circuit_open"] == 0
+    # 灌一次熔断后计数变化
+    for _ in range(rot.CIRCUIT_FAIL_THRESHOLD):
+        rot._record_circuit_fail("一号", "glm-5.3-flash")
+    h2 = rot.health_status()
+    assert h2["circuit_open"] == 2  # 账号级 + 模型级同时打开
+
+
+def test_rotator_health_endpoint_route(rot, monkeypatch):
+    """/health 路由返回独立健康状态（不再与 /v1/models 共用）"""
+    _write_pool(rot, [{"name": "一号", "refresh_token": "a", "priority": 1}])
+    fake = _FakeHandler()
+    fake.headers = {"Authorization": "Bearer " + (rot.AUTH_KEY or "")}
+    fake.path = "/health"
+    monkeypatch.setattr(rot, "AUTH_KEY", "")
+    rot.ProxyHandler.do_GET(fake)
+    assert fake.status == 200
+    assert fake.last_json["status"] == "ok"
+    assert fake.last_json["process"] == "rotator"
+    assert "data" not in fake.last_json  # 不再是模型列表形状
+
+
+def test_manager_health_endpoint(mgr):
+    """manager /api/health 独立健康端点：DB 概况 + 账号池 + 调度器"""
+    main = mgr["main"]
+    db = mgr["db"]
+    db.add_account("主号", "u1", "tok1", priority=1)
+    h = main.api_health()
+    assert h["status"] == "ok"
+    assert h["process"] == "manager"
+    assert h["db_rows"]["accounts"] >= 1
+    assert h["accounts_total"] >= 1
+    assert h["uptime_seconds"] >= 0
+
+
+def test_diagnostics_aggregates_both_processes(mgr):
+    """聚合诊断端点：含 manager 与 rotator 两块状态 + 总览"""
+    main = mgr["main"]
+    d = main.api_diagnostics()
+    assert d["manager"]["process"] == "manager"
+    assert d["rotator"]["process"] == "rotator"
+    # rotator 无服务在跑时如实报 down，不抛异常
+    assert d["rotator"]["status"] in ("ok", "down")
+    assert d["overall"] in ("ok", "degraded")
+
+
+def test_restore_drill_roundtrip(mgr, tmp_path, monkeypatch):
+    """恢复演练：用真实备份在临时目录恢复，表行数/账号数对账一致"""
+    import importlib.util as _ilu
+    import app.backup as backup
+    db = mgr["db"]
+    a1 = db.add_account("主号", "u1", "tok1", priority=1)
+    db.add_checkin_log(a1, True, "成功", "+50")
+    rot_home = mgr["rot_home"]
+    with open(os.path.join(rot_home, "accounts.json"), "w", encoding="utf-8") as f:
+        json.dump({"accounts": [{"name": "主号", "refresh_token": "rt1"}]}, f)
+    backup_dir = str(tmp_path / "backup")
+    monkeypatch.setattr(backup, "BACKUP_DIR", backup_dir)
+    summary = backup.run_backup("test")
+    assert summary["ok"]
+
+    # 加载恢复演练脚本（独立模块，不依赖 app 包）
+    spec = _ilu.spec_from_file_location(
+        "restore_drill", os.path.join(ROOT, "deploy", "restore_drill.py"))
+    rd = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(rd)
+    workdir = str(tmp_path / "restore")
+    result = rd.run_drill(summary["backup_dir"], workdir)
+    assert result["rows_ok"] is True
+    assert result["accounts_ok"] is True
+    assert result["passed"] is True
+    assert result["actual_rows"] == result["expected_rows"]
+

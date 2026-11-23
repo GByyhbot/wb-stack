@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -683,6 +684,98 @@ def api_set_settings(s: SettingsIn):
     if "checkin_time" in changed:
         scheduler.reschedule_checkin()
     return {"ok": True, "changed": changed}
+
+
+# ---------- 独立健康与聚合诊断（批次4 项4） ----------
+_MGR_START_TS = time.time()
+
+
+def _manager_health():
+    """manager 进程独立健康状态：存活、DB 概况、调度器、账号池、最近错误。"""
+    try:
+        conn = db.get_db()
+        rows = {t: conn.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
+                for t in ("accounts", "checkin_logs", "settings")}
+    except Exception as e:
+        rows = None
+        db_err = str(e)[:200]
+    else:
+        db_err = ""
+    accounts = db.list_accounts()
+    active = [a for a in accounts if a.get("status") == "active"]
+    error_accs = [a for a in accounts if a.get("status") == "error"]
+    # 调度器任务概况
+    jobs = []
+    try:
+        sched = scheduler._scheduler
+        if sched is not None:
+            jobs = [{"id": j.id, "name": j.name} for j in sched.get_jobs()]
+    except Exception:
+        jobs = []
+    # 最近错误：签到日志里最近的失败记录
+    recent_errors = []
+    try:
+        for r in db.recent_logs(limit=20):
+            if not r.get("ok"):
+                recent_errors.append({
+                    "ts": r.get("created_at"), "account": r.get("account_name"),
+                    "message": (r.get("message") or "")[:200]})
+            if len(recent_errors) >= 5:
+                break
+    except Exception:
+        pass
+    return {
+        "status": "ok" if db_err == "" else "error",
+        "process": "manager",
+        "uptime_seconds": round(time.time() - _MGR_START_TS, 1),
+        "db_rows": rows,
+        "db_error": db_err,
+        "scheduler_jobs": jobs,
+        "accounts_total": len(accounts),
+        "accounts_active": len(active),
+        "accounts_error": len(error_accs),
+        "recent_errors": recent_errors,
+    }
+
+
+@app.get("/api/health")
+def api_health():
+    """manager 独立健康端点（不再只靠容器二元探活）。"""
+    return _manager_health()
+
+
+def _rotator_health_via_http():
+    """通过本地 HTTP 拉取 rotator 的独立健康状态（同容器 127.0.0.1）。
+
+    rotator 不可达时返回 status=down，不抛异常——聚合诊断要能如实反映
+    「网关挂了」这一事实，而不是把自己也带崩。
+    """
+    import urllib.request
+    port = os.environ.get("WB_PORT_ROTATOR", "8310")
+    key = os.environ.get("WB_ROTATOR_KEY", "")
+    headers = {"Authorization": "Bearer " + key} if key else {}
+    req = urllib.request.Request("http://127.0.0.1:%s/health" % port, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return {"status": "down", "process": "rotator",
+                "error": str(e)[:200]}
+
+
+@app.get("/api/diagnostics")
+def api_diagnostics():
+    """聚合诊断：一条端点看两进程状态、账号池概况、最近错误。"""
+    mgr = _manager_health()
+    rot = _rotator_health_via_http()
+    return {
+        "generated_at": scheduler.time_str(),
+        "manager": mgr,
+        "rotator": rot,
+        "overall": "ok" if (mgr.get("status") == "ok" and rot.get("status") == "ok")
+                   else "degraded",
+    }
+
 
 
 # ---------- 额度自动切换 API（核心） ----------

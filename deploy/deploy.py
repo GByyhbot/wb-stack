@@ -78,6 +78,7 @@ def build_archive():
         "deploy/docker-compose.yml",
         "deploy/entrypoint.py",
         "deploy/healthcheck.py",
+        "deploy/restore_drill.py",
         "deploy/.env.example",
     ]
     if os.path.exists(ENV_FILE):

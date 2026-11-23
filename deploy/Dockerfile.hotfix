@@ -16,3 +16,4 @@ COPY wb-manager/static /app/static
 COPY wb-rotator/rotator.py /app/rotator.py
 COPY deploy/entrypoint.py /app/entrypoint.py
 COPY deploy/healthcheck.py /app/healthcheck.py
+COPY deploy/restore_drill.py /app/restore_drill.py

@@ -14,6 +14,7 @@ from apscheduler.triggers.cron import CronTrigger
 from . import db
 from . import gateway_sync
 from . import growth_client
+from . import backup
 from . import workbuddy_client as wb
 
 log = logging.getLogger("wb-manager.scheduler")
@@ -238,8 +239,12 @@ def start_scheduler():
     _scheduler.add_job(run_quota_refresh, CronTrigger(minute=0, timezone="Asia/Shanghai"),
                        id="quota_refresh", replace_existing=True,
                        misfire_grace_time=600, coalesce=True, max_instances=1)
+    # 批次4：每日 03:30 自动备份（避开签到 08:30 与整点额度刷新）
+    _scheduler.add_job(backup.run_backup, CronTrigger(hour=3, minute=30, timezone="Asia/Shanghai"),
+                       id="daily_backup", args=["cron"], replace_existing=True,
+                       misfire_grace_time=3600, coalesce=True, max_instances=1)
     _scheduler.start()
-    log.info("调度器已启动: 每日 %02d:%02d 签到 / 每小时整点刷新额度", h, m)
+    log.info("调度器已启动: 每日 %02d:%02d 签到 / 每小时整点刷新额度 / 每日 03:30 备份", h, m)
     return _scheduler
 
 

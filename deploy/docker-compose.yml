@@ -15,6 +15,7 @@ services:
       WB_ROTATOR_KEY: ${ROTATOR_KEY}
       WB_DB_PATH: /data/manager/wb_manager.db
       WB_ROTATOR_HOME: /data/rotator
+      WB_BACKUP_DIR: /data/backup
       WB_PORT_MANAGER: "8300"
       WB_PORT_ROTATOR: "8310"
       TZ: Asia/Shanghai

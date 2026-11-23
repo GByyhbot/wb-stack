@@ -777,6 +777,84 @@ def _circuit_model_open(name, model):
     return bool(e and e.get("open_until", 0) > time.time())
 
 
+# ---- 独立健康状态（批次4 项4）：/health 不再与 /v1/models 共用响应 ----
+_START_TS = time.time()
+
+
+def health_status():
+    """rotator 进程独立健康状态：存活、账号池概况、熔断概况、最近错误。
+
+    供 /health 端点与聚合诊断读取；不触网、不落账，只读本地状态文件。"""
+    now = time.time()
+    # 账号池概况
+    pool = []
+    try:
+        pool = load_accounts()
+    except Exception:
+        pool = []
+    td = today()
+    acct = [{
+        "name": a.get("name"),
+        "priority": a.get("priority", 100),
+        "disabled": bool(a.get("disabled")),
+        "exhausted_today": a.get("exhausted_date") == td,
+        "credits": a.get("last_credits"),
+    } for a in pool]
+    # 熔断概况：当前打开中的条目
+    try:
+        st = _load_circuit_state()
+        open_cnt = sum(1 for e in st.values()
+                       if isinstance(e, dict) and e.get("open_until", 0) > now)
+    except Exception:
+        open_cnt = 0
+    # 最近错误：从请求日志取最近若干条 error 记录
+    recent_errors = _recent_log_errors(5)
+    return {
+        "status": "ok",
+        "process": "rotator",
+        "uptime_seconds": round(now - _START_TS, 1),
+        "accounts_total": len(acct),
+        "accounts_active": sum(1 for a in acct if not a["disabled"]),
+        "accounts": acct,
+        "circuit_open": open_cnt,
+        "recent_errors": recent_errors,
+    }
+
+
+def _recent_log_errors(limit=5):
+    """从请求日志（logs/requests-*.jsonl）尾部读取最近 error 记录。"""
+    out = []
+    try:
+        if not os.path.isdir(LOG_DIR):
+            return out
+        files = sorted(f for f in os.listdir(LOG_DIR)
+                       if f.startswith("requests-") and f.endswith(".jsonl"))
+        for fn in reversed(files):
+            path = os.path.join(LOG_DIR, fn)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            except Exception:
+                continue
+            for line in reversed(lines):
+                if len(out) >= limit:
+                    break
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("error"):
+                    out.append({"ts": r.get("ts"), "account": r.get("account"),
+                                "model": r.get("model"), "status": r.get("status"),
+                                "error": (r.get("error") or "")[:200]})
+            if len(out) >= limit:
+                break
+    except Exception:
+        pass
+    return out
+
+
+
 # C. 并发分配锁：选号与占用原子化，防并发请求撞同号。
 #    _inuse 为进程内内存登记，_inuse_lock 保护；请求结束必须释放（try/finally 兜底）。
 _inuse = {}            # {账号名: 占用计数}
@@ -1526,7 +1604,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not _require_auth(self):
             return
-        if self.path in ("/health", "/v1/models"):
+        if self.path == "/health":
+            # 批次4：独立健康状态（不再与 /v1/models 共用响应体）
+            self._json(200, health_status())
+            return
+        if self.path == "/v1/models":
             models = []
             for m in sorted(MODEL_WHITELIST):
                 vision = m in VISION_MODELS
