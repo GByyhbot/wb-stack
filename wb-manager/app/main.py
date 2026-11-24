@@ -15,6 +15,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
 from . import db
+from . import quota_status as qstatus
 from . import gateway_sync
 from . import scheduler
 from . import workbuddy_client as wb
@@ -761,6 +762,58 @@ def _rotator_health_via_http():
     except Exception as e:
         return {"status": "down", "process": "rotator",
                 "error": str(e)[:200]}
+
+
+def _rotator_snapshot_via_http():
+    """二期第 2 批：从同容器 rotator 拉只读额度快照；不可达返回 down 结构不抛异常。"""
+    import urllib.request
+    port = os.environ.get("WB_PORT_ROTATOR", "8310")
+    key = os.environ.get("WB_ROTATOR_KEY", "")
+    headers = {"Authorization": "Bearer " + key} if key else {}
+    req = urllib.request.Request("http://127.0.0.1:%s/quota/snapshot" % port,
+                                 headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return {"status": "down", "process": "rotator", "cells": [],
+                "quota_enabled": False, "error": str(e)[:200]}
+
+
+@app.get("/api/model-quotas")
+def api_model_quotas():
+    """只读额度快照：透传 rotator 数据，附加展示状态与 manager 侧时间戳。"""
+    snap = _rotator_snapshot_via_http()
+    snap["generated_at"] = scheduler.time_str()
+    cells = snap.get("cells")
+    if isinstance(cells, list):
+        for cell in cells:
+            if isinstance(cell, dict):
+                cell.update(qstatus.merge_cell_status(cell))
+    return snap
+
+
+@app.get("/api/model-quotas/events")
+def api_model_quota_events(limit: int = Query(50, ge=1, le=200)):
+    """只读额度事件：按 id 倒序返回最近 N 条，不返回 raw_headers/raw_body 全文。"""
+    import sqlite3
+    fields = ("created_at", "account_name", "model_id", "event_type",
+              "http_status", "error_code", "retry_after", "reset_at",
+              "raw_headers", "raw_body")
+    try:
+        conn = db.get_db()
+        rows = conn.execute(
+            "SELECT %s FROM model_quota_events ORDER BY id DESC LIMIT ?" % ",".join(fields),
+            (limit,)).fetchall()
+    except Exception:
+        # 兼容引擎尚未跑过、表不存在的环境
+        return []
+    out = []
+    for r in rows:
+        item = {k: r[k] for k in fields if not k.startswith("raw_")}
+        item["has_raw"] = bool(r["raw_headers"] or r["raw_body"])
+        out.append(item)
+    return out
 
 
 @app.get("/api/diagnostics")

@@ -1315,3 +1315,116 @@ def test_restore_drill_roundtrip(mgr, tmp_path, monkeypatch):
     assert result["passed"] is True
     assert result["actual_rows"] == result["expected_rows"]
 
+
+# --------------------------------------------------------------------------
+# 二期第 2 批：只读额度监控面板
+# --------------------------------------------------------------------------
+def test_model_quotas_endpoint_down_when_rotator_unreachable(mgr, monkeypatch):
+    """rotator 不可达时 /api/model-quotas 返回 down 结构，不抛异常、不白屏。"""
+    import urllib.request
+    main = mgr["main"]
+
+    def boom(req, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    result = main.api_model_quotas()
+    assert result["status"] == "down"
+    assert result["cells"] == []
+    assert result["quota_enabled"] is False
+    assert "generated_at" in result  # manager 侧时间戳仍然附上
+
+
+def test_model_quota_events_endpoint_shape(mgr):
+    """events 按 id 倒序、limit 生效，且响应不含 raw_headers/raw_body 全文。"""
+    main = mgr["main"]
+    conn = mgr["db"].get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_quota_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_name TEXT NOT NULL, model_id TEXT NOT NULL,
+            event_type TEXT NOT NULL, http_status INTEGER, error_code TEXT,
+            retry_after INTEGER, reset_at TEXT, raw_headers TEXT,
+            raw_body TEXT, created_at TEXT NOT NULL)
+    """)
+    conn.execute("DELETE FROM model_quota_events")
+    conn.executemany(
+        "INSERT INTO model_quota_events "
+        "(account_name,model_id,event_type,http_status,error_code,retry_after,reset_at,raw_headers,raw_body,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [
+            ("一号", "glm-5.3-flash", "upstream_exhaust_response", 429, "http_429",
+             30, None, '{"Retry-After":"30"}', '{"error":"rate_limit"}', "2026-11-24 10:00:00"),
+            ("二号", "hy4free", "would_skip", None, "request_threshold_reached",
+             None, None, None, None, "2026-11-24 11:00:00"),
+            ("三号", "deepseek-v4.1-flash", "upstream_exhaust_response", 402, "http_402",
+             None, None, '{"x":"y"}', "body", "2026-11-24 12:00:00"),
+        ])
+    conn.commit()
+    rows = main.api_model_quota_events(limit=2)
+    assert len(rows) == 2
+    assert rows[0]["created_at"] > rows[1]["created_at"]  # id 倒序
+    assert [r["created_at"] for r in rows] == [
+        "2026-11-24 12:00:00", "2026-11-24 11:00:00"]
+    for r in rows:
+        assert "raw_headers" not in r and "raw_body" not in r
+        assert isinstance(r["has_raw"], bool)
+    assert rows[0]["has_raw"] is True   # 402 样本带 raw_headers/raw_body
+    assert rows[1]["has_raw"] is False  # would_skip 样本无原文
+    assert main.api_model_quota_events(limit=99)[0]["has_raw"] is True  # 上限内正常
+
+
+def test_model_quota_events_endpoint_without_table(mgr, monkeypatch):
+    """表不存在时返回空数组，不把 manager 带崩。"""
+    main = mgr["main"]
+    conn = mgr["db"].get_db()
+
+    class _FakeConn:
+        def execute(self, *a, **kw):
+            raise sqlite3.OperationalError("no such table: model_quota_events")
+
+    monkeypatch.setattr(mgr["db"], "get_db", lambda: _FakeConn())
+    assert main.api_model_quota_events(limit=50) == []
+
+
+def test_quota_status_priority_merge(mgr):
+    """状态优先级：耗尽 > 冷却 > 达阈值 > 预警 > 未知；未知不产百分比。"""
+    from app import quota_status as qs
+    now = 1000.0
+    base = {
+        "disabled": False, "exhausted_today": False, "account_exhausted_today": False,
+        "soft_cooldown_until": None, "engine_status": "ok", "status": "ok",
+        "success_count": 0, "in_flight": 0, "tokens_used": 0,
+        "daily_request_limit": 10, "safe_request_limit": 10,
+        "daily_token_limit": None, "safe_token_limit": None,
+    }
+
+    def merged(**kw):
+        cell = dict(base)
+        cell.update(kw)
+        return qs.merge_cell_status(cell, now_ts=now)
+
+    # 真耗尽压冷却
+    c = merged(exhausted_today=True, soft_cooldown_until=now + 60,
+               engine_status="cooldown")
+    assert c["status"] == "exhausted" and c["status_label"] == "已耗尽"
+    # 冷却压达阈值，且带剩余秒数
+    c = merged(soft_cooldown_until=now + 60, engine_status="threshold_reached")
+    assert c["status"] == "cooldown" and c["remaining_seconds"] == 60
+    # 达阈值压预警（8/10 同时满足 80% 预警条件）
+    c = merged(success_count=8, engine_status="threshold_reached")
+    assert c["status"] == "threshold"
+    # 预警（纯展示）
+    c = merged(success_count=8)
+    assert c["status"] == "warning" and c["percent"] == 80
+    # 未知额度：无百分比、不产生预警
+    c = merged(success_count=99, daily_request_limit=None, safe_request_limit=None,
+               daily_token_limit=None, safe_token_limit=None)
+    assert c["status"] == "unknown" and c["percent"] is None
+    # 禁用最优先
+    c = merged(disabled=True, exhausted_today=True)
+    assert c["status"] == "disabled"
+    # 正常
+    c = merged(success_count=1)
+    assert c["status"] == "normal"
+

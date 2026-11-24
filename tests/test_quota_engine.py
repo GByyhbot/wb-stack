@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -537,6 +538,54 @@ def test_quota_disabled_is_full_bypass(rot_q, monkeypatch, tmp_path, capsys):
     assert "would_skip" not in capsys.readouterr().err
     # 完全旁路：引擎连 DB 都不碰，额度库根本不会被创建
     assert not os.path.isfile(db)
+
+
+def test_quota_snapshot_endpoint_when_engine_disabled(rot_q, monkeypatch, tmp_path):
+    """引擎关闭时 /quota/snapshot 仍返回 200，quota_enabled=false 且 cells 为空。"""
+    _reset(rot_q, monkeypatch, str(tmp_path / "q2off.db"), enabled="0")
+    with open(rot_q.ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"accounts": [{"name": "一号", "refresh_token": "rt", "priority": 1}]}, f)
+    fake = _QFakeHandler()
+    fake.path = "/quota/snapshot"
+    rot_q.ProxyHandler.do_GET(fake)
+    assert fake.status == 200
+    assert fake.last_json["quota_enabled"] is False
+    assert fake.last_json["cells"] == []
+    assert len(fake.last_json["accounts"]) == 1
+
+
+def test_quota_snapshot_merges_model_state_fields(rot_q, monkeypatch, tmp_path):
+    """快照每格合并 model_state 的 soft_cooldown_until 与 exhausted_today。"""
+    db = str(tmp_path / "q2snap.db")
+    eng = _reset(rot_q, monkeypatch, db)
+    eng.upsert_limit("glm-5.3-flash", daily_request_limit=10, safe_percent=95.0)
+    accounts = [
+        {"name": "一号", "refresh_token": "r1", "priority": 1},
+        {"name": "二号", "refresh_token": "r2", "priority": 2},
+    ]
+    with open(rot_q.ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"accounts": accounts}, f)
+    with open(rot_q.MODEL_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({
+            "一号|glm-5.3-flash": {"date": rot_q.today(), "cooldown_until": time.time() + 120},
+            "二号|glm-5.3-flash": {"date": rot_q.today(), "hard": True},
+        }, f)
+    fake = _QFakeHandler()
+    fake.path = "/quota/snapshot"
+    rot_q.ProxyHandler.do_GET(fake)
+    assert fake.status == 200
+    snap = fake.last_json
+    assert snap["quota_mode"] == "observe"
+    assert len(snap["cells"]) == len(accounts) * len(rot_q.QUOTA_MODELS) == 8
+    by_key = {(c["account_name"], c["model_id"]): c for c in snap["cells"]}
+    soft = by_key[("一号", "glm-5.3-flash")]
+    assert soft["soft_cooldown_until"] > time.time()
+    assert soft["exhausted_today"] is False
+    hard = by_key[("二号", "glm-5.3-flash")]
+    assert hard["exhausted_today"] is True
+    assert hard["soft_cooldown_until"] is None
+    # 未配置 model_state 的模型格不受影响
+    assert by_key[("一号", "hy4free")]["exhausted_today"] is False
 
 
 if __name__ == "__main__":

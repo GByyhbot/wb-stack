@@ -1007,6 +1007,63 @@ def health_status():
     }
 
 
+# 面板矩阵固定列顺序（施工令第 7 条）；与 MODEL_WHITELIST 内容一致
+QUOTA_MODELS = ["glm-5.3-flash", "deepseek-v4.1-flash", "hy4free", "hy4flash-free"]
+
+
+def quota_snapshot_status():
+    """二期第 2 批：只读账号×模型额度快照，供面板展示。不写任何状态文件。"""
+    now_ts = time.time()
+    pool = []
+    try:
+        pool = load_accounts()
+    except Exception:
+        pass
+    accounts = [{
+        "name": a.get("name"),
+        "priority": a.get("priority", 100),
+        "disabled": bool(a.get("disabled")),
+        "exhausted_today": a.get("exhausted_date") == today(),
+        "credits": a.get("last_credits"),
+    } for a in pool if a.get("name")]
+    base = {
+        "status": "ok",
+        "process": "rotator",
+        "quota_enabled": _quota_enabled(),
+        "quota_mode": _quota_mode(),
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "accounts": accounts,
+        "models": list(QUOTA_MODELS),
+        "cells": [],
+    }
+    eng = get_quota_engine()
+    if eng is None:
+        return base
+    try:
+        cands = [quota_mod.AccountCandidate(
+            name=a["name"], priority=a["priority"],
+            enabled=not a["disabled"] and not a["exhausted_today"],
+            credits=a.get("credits")) for a in accounts]
+        cells = eng.get_snapshot(cands, QUOTA_MODELS)
+    except Exception as e:
+        base["error"] = str(e)[:200]
+        return base
+    # 合并现行 model_state.json：冷却截止与当日真耗尽（口径与 pick 过滤一致）
+    state = _load_model_state()
+    td = today()
+    by_name = {a["name"]: a for a in accounts}
+    for c in cells:
+        entry = state.get("%s|%s" % (c["account_name"], c["model_id"]))
+        entry = entry if isinstance(entry, dict) else {}
+        c["soft_cooldown_until"] = entry.get("cooldown_until") if not entry.get("hard") else None
+        c["exhausted_today"] = bool(entry.get("hard") and entry.get("date") == td)
+        acc = by_name.get(c["account_name"], {})
+        c["disabled"] = bool(acc.get("disabled"))
+        c["account_exhausted_today"] = bool(acc.get("exhausted_today"))
+    base["cells"] = cells
+    return base
+
+
 def _recent_log_errors(limit=5):
     """从请求日志（logs/requests-*.jsonl）尾部读取最近 error 记录。"""
     out = []
@@ -1822,6 +1879,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             # 批次4：独立健康状态（不再与 /v1/models 共用响应体）
             self._json(200, health_status())
+            return
+        if self.path == "/quota/snapshot":
+            # 二期第 2 批：只读额度快照（引擎关闭也返回 200 + 空 cells）
+            self._json(200, quota_snapshot_status())
             return
         if self.path == "/v1/models":
             models = []

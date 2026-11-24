@@ -216,6 +216,25 @@
   .table-scroll thead th { position: sticky; top: 0; background: var(--panel); z-index: 2; }
   .badge.growth { background: rgba(52,211,153,.15); color: var(--green); }
   .log-msg { max-width: 460px; word-break: break-word; line-height: 1.5; }
+
+  /* ---- 二期第 2 批：额度监控（只读矩阵） ---- */
+  .quota-summary { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .quota-stat { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px;
+                padding: 8px 12px; font-size: 11.5px; color: var(--muted); min-width: 132px; }
+  .quota-stat b { display: block; margin-top: 3px; font-size: 14px; color: var(--text); }
+  .qbadge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+  .q-disabled { background: rgba(138,146,168,.16); color: var(--muted); }
+  .q-exhausted { background: rgba(248,113,113,.18); color: var(--red); }
+  .q-cooldown { background: rgba(251,146,60,.17); color: #fb923c; }
+  .q-threshold { background: rgba(251,191,36,.16); color: var(--yellow); }
+  .q-warning { background: rgba(253,224,71,.14); color: #fde047; }
+  .q-unknown { background: rgba(138,146,168,.10); color: var(--muted); }
+  .q-normal { background: rgba(52,211,153,.15); color: var(--green); }
+  .q-cell { min-width: 158px; }
+  .q-cell .q-line { font-size: 11px; color: var(--muted); margin-top: 3px; white-space: nowrap; }
+  .q-empty { padding: 28px 12px !important; text-align: center; color: var(--muted); font-size: 13px; }
+  .quota-matrix { min-width: 780px; }
+  .q-event-wouldskip { background: rgba(251,191,36,.06); }
   button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
     outline: 2px solid var(--accent); outline-offset: 1px; }
   @media (prefers-reduced-motion: reduce) {
@@ -239,6 +258,7 @@
       <button class="nav-item" data-view="recommend" onclick="showView('recommend')">🧭 用量推荐<span class="nav-badge" id="recRiskBadge"></span></button>
       <button class="nav-item" data-view="usage" onclick="showView('usage')">📊 用量统计</button>
       <button class="nav-item" data-view="manage" onclick="showView('manage')">⚙️ 账号与设置</button>
+      <button class="nav-item" data-view="quota" onclick="showView('quota')">🎛️ 额度监控</button>
     </nav>
     <div class="spacer"></div>
     <div class="side-foot">
@@ -447,6 +467,38 @@
         </div>
       </section>
 
+      <!-- ============ 额度监控（二期第 2 批，只读） ============ -->
+      <section class="view" id="view-quota">
+        <div class="view-head">
+          <h2>🎛️ 额度监控</h2>
+          <span class="right"><button class="btn" onclick="loadQuota()">↻ 刷新</button></span>
+        </div>
+        <div class="quota-summary" id="quotaSummary">
+          <div class="quota-stat">引擎状态<b>—</b></div>
+          <div class="quota-stat">今日总请求<b>—</b></div>
+          <div class="quota-stat">今日 would_skip<b>—</b></div>
+          <div class="quota-stat">最近一次 429<b>—</b></div>
+        </div>
+        <div class="card">
+          <h2>🧮 账号 × 模型状态矩阵 <span class="badge" id="quotaMatrixBadge"></span></h2>
+          <div class="table-scroll">
+            <table class="quota-matrix">
+              <thead><tr id="quotaHead"><th>账号</th></tr></thead>
+              <tbody id="quotaBody"><tr><td colspan="5" class="q-empty">加载中…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <h2>🧾 最近事件 <span class="badge" id="quotaEventBadge"></span></h2>
+          <div class="table-scroll tall">
+            <table>
+              <thead><tr><th>时间</th><th>账号</th><th>模型</th><th>事件</th><th>状态 / 错误码</th></tr></thead>
+              <tbody id="quotaEventBody"><tr><td colspan="5" class="muted">暂无事件</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
     </div>
   </main>
 </div>
@@ -456,11 +508,98 @@ const API = '';
 const AVATAR_COLORS = ['#5b8cff', '#7c5bff', '#34d399', '#f59e0b', '#f87171', '#22d3ee'];
 const SHARE_COLORS = ['#5b8cff', '#7c5bff', '#34d399', '#f59e0b', '#f87171', '#22d3ee', '#a78bfa', '#f472b6'];
 
+// ---- 额度监控（二期第 2 批：纯只读，不发任何写请求） ----
+function _localDateStr(d) {
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' +
+         String(d.getDate()).padStart(2, '0');
+}
+async function loadQuota() {
+  const summary = document.getElementById('quotaSummary');
+  const head = document.getElementById('quotaHead');
+  const body = document.getElementById('quotaBody');
+  const evBody = document.getElementById('quotaEventBody');
+  const badge = document.getElementById('quotaMatrixBadge');
+  const evBadge = document.getElementById('quotaEventBadge');
+  let snap, events;
+  try {
+    [snap, events] = await Promise.all([
+      req('GET', '/api/model-quotas'),
+      req('GET', '/api/model-quotas/events?limit=50')
+    ]);
+  } catch (e) {
+    summary.innerHTML = '<div class="quota-stat">引擎状态<b>网关不可达</b></div>';
+    body.innerHTML = '<tr><td colspan="5" class="q-empty">网关不可达</td></tr>';
+    evBody.innerHTML = '<tr><td colspan="5" class="muted">网关不可达</td></tr>';
+    return;
+  }
+  const down = snap.status === 'down';
+  const on = !down && snap.quota_enabled !== false;
+  const mode = down ? '网关不可达' : (on ? (snap.quota_mode || 'observe') : 'off');
+  const cells = Array.isArray(snap.cells) ? snap.cells : [];
+  const evs = Array.isArray(events) ? events : [];
+  const todayStr = _localDateStr(new Date());
+  const skips = evs.filter(e => e.event_type === 'would_skip' &&
+                           String(e.created_at || '').slice(0, 10) === todayStr).length;
+  const last429 = evs.find(e => Number(e.http_status) === 429);
+  const totalReq = cells.reduce((s, c) => s + (Number(c.success_count) || 0), 0);
+  summary.innerHTML =
+    '<div class="quota-stat">引擎状态<b>' + esc(mode) + '</b></div>' +
+    '<div class="quota-stat">今日总请求<b>' + totalReq + '</b></div>' +
+    '<div class="quota-stat">今日 would_skip<b>' + skips + '</b></div>' +
+    '<div class="quota-stat">最近一次 429<b>' + esc(last429 ? last429.created_at : '—') + '</b></div>';
+
+  evBadge.textContent = evs.length + ' 条';
+  evBody.innerHTML = evs.length ? evs.map(e =>
+    '<tr class="' + (e.event_type === 'would_skip' ? 'q-event-wouldskip' : '') + '">' +
+      '<td>' + esc(e.created_at || '—') + '</td>' +
+      '<td>' + esc(e.account_name || '—') + '</td>' +
+      '<td class="code">' + esc(e.model_id || '—') + '</td>' +
+      '<td>' + esc(e.event_type || '—') + (e.has_raw ? ' <span class="badge">raw</span>' : '') + '</td>' +
+      '<td>' + esc(e.http_status == null ? '—' : e.http_status) + ' ' + esc(e.error_code || '') + '</td>' +
+    '</tr>').join('') : '<tr><td colspan="5" class="muted">暂无事件</td></tr>';
+
+  if (down || !on) {
+    badge.textContent = '';
+    body.innerHTML = '<tr><td colspan="5" class="q-empty">' +
+                     (down ? '网关不可达' : '额度引擎未启用') + '</td></tr>';
+    return;
+  }
+  const accounts = Array.isArray(snap.accounts) ? snap.accounts : [];
+  const models = Array.isArray(snap.models) ? snap.models :
+    ['glm-5.3-flash', 'deepseek-v4.1-flash', 'hy4free', 'hy4flash-free'];
+  head.innerHTML = '<th>账号</th>' + models.map(m => '<th class="code">' + esc(m) + '</th>').join('');
+  badge.textContent = accounts.length + ' × ' + models.length;
+  const byKey = {};
+  cells.forEach(c => { byKey[c.account_name + '|' + c.model_id] = c; });
+  const sorted = accounts.slice().sort((a, b) =>
+    (Number(a.priority) || 100) - (Number(b.priority) || 100) ||
+    String(a.name).localeCompare(String(b.name), 'zh'));
+  body.innerHTML = sorted.map(a => {
+    const tds = models.map(m => {
+      const c = byKey[a.name + '|' + m];
+      if (!c) return '<td class="q-cell"><span class="muted">—</span></td>';
+      const level = String(c.status || 'normal').replace(/[^a-z]/g, '');
+      const tail = level === 'cooldown' && c.remaining_seconds ? ' · 剩 ' + c.remaining_seconds + 's' : '';
+      const usageLine = (Number(c.success_count) || 0) + ' 次 · ' + fmtTokens(c.tokens_used) + ' tk';
+      const limitLine = c.percent == null
+        ? '限额未知 · 重置 —'
+        : (Number(c.success_count) || 0) + '/' + esc(c.safe_request_limit) + ' · ' + c.percent + '% · 重置 —';
+      return '<td class="q-cell"><span class="qbadge q-' + esc(level) + '">' +
+             esc(c.status_label || '正常') + esc(tail) + '</span>' +
+             '<div class="q-line">' + esc(usageLine) + '</div>' +
+             '<div class="q-line">' + esc(limitLine) + '</div></td>';
+    }).join('');
+    return '<tr' + (a.disabled ? ' style="opacity:.55"' : '') + '><td><b>' +
+           esc(a.name) + '</b></td>' + tds + '</tr>';
+  }).join('') || '<tr><td colspan="5" class="q-empty">账号池为空</td></tr>';
+}
+
 // ---- 视图切换 ----
 function showView(name) {
   document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + name));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.view === name));
   if (name === 'recommend') loadRecommendation();
+  if (name === 'quota') loadQuota();
   window.scrollTo({ top: 0 });
 }
 
@@ -1028,8 +1167,8 @@ async function refreshAllQuota() {
   toast('可用积分刷新完成'); loadAccounts(); loadActive();
 }
 
-loadAccounts(); loadActive(); loadLogs(); loadSettings(); loadUsage(); loadPin(); loadRecommendation(); loadGatewayInfo(); loadGrowthToday();
-setInterval(() => { loadAccounts(); loadActive(); loadUsage(); loadRecommendation(); loadGrowthToday(); }, 60000);
+loadAccounts(); loadActive(); loadLogs(); loadSettings(); loadUsage(); loadPin(); loadRecommendation(); loadGatewayInfo(); loadGrowthToday(); loadQuota();
+setInterval(() => { loadAccounts(); loadActive(); loadUsage(); loadRecommendation(); loadGrowthToday(); loadQuota(); }, 60000);
 </script>
 </body>
 </html>
