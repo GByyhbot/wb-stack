@@ -14,6 +14,7 @@ FROM wb-single:latest
 COPY wb-manager/app /app/app
 COPY wb-manager/static /app/static
 COPY wb-rotator/rotator.py /app/rotator.py
+COPY wb-rotator/quota_engine.py /app/quota_engine.py
 COPY deploy/entrypoint.py /app/entrypoint.py
 COPY deploy/healthcheck.py /app/healthcheck.py
 COPY deploy/restore_drill.py /app/restore_drill.py

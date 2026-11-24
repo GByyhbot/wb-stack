@@ -194,9 +194,195 @@ def route_model(model_l):
 EXHAUST_HTTP_CODES = {402, 429}
 EXHAUST_KEYWORDS = ("credit", "insufficient", "quota", "余额", "额度", "耗尽", "用尽")
 
-MAX_SWITCH_RETRY = 5  # 单次请求最多切换账号次数
+# 单次请求最多切换账号次数：账号数不足 10 按实际数，硬顶 10（二期第 1 批）
+MAX_SWITCH_RETRY = 10
 
 _lock = threading.RLock()
+
+
+# ----------------------------------------------------------------------------
+# 二期第 1 批：模型级额度引擎接入层（observe 先行）
+# 原则：引擎只做 pick_and_reserve 内部的事前预检层，不另立选号/冷却/预占体系。
+# WB_QUOTA_ENABLED=0 时完全旁路，选号行为与现行逐字节一致（回滚开关）。
+# ----------------------------------------------------------------------------
+_ROTATOR_DIR = os.path.dirname(os.path.abspath(__file__))
+if _ROTATOR_DIR not in sys.path:
+    sys.path.insert(0, _ROTATOR_DIR)
+try:
+    import quota_engine as quota_mod
+except Exception as _qe_import_exc:  # 引擎文件缺失时降级旁路，不让网关起不来
+    quota_mod = None
+    sys.stderr.write("[rotator] 额度引擎导入失败，已旁路: %s\n" % _qe_import_exc)
+
+# 仓库白名单中的免费模型（产品配置 credits=0；限额未知，不伪造）
+FREE_MODELS = ("hy4free", "hy4flash-free")
+
+_quota_engine = None
+_quota_init_lock = threading.Lock()
+_quota_event_drop_count = 0
+
+
+def _quota_enabled():
+    return os.environ.get("WB_QUOTA_ENABLED", "1").strip() != "0"
+
+
+def _quota_mode():
+    mode = os.environ.get("WB_QUOTA_MODE", "observe").strip().lower()
+    return mode if mode in ("observe", "enforce") else "observe"
+
+
+def get_quota_engine():
+    """惰性单例：启动时（cmd_serve）与首次选号时幂等建表；DB 不可用时旁路。"""
+    global _quota_engine
+    if not _quota_enabled() or quota_mod is None:
+        return None
+    if _quota_engine is not None:
+        return _quota_engine
+    with _quota_init_lock:
+        if _quota_engine is not None:
+            return _quota_engine
+        db_path = os.environ.get("WB_DB_PATH", "")
+        if not db_path:
+            sys.stderr.write("[rotator] 额度引擎旁路：WB_DB_PATH 未设置\n")
+            return None
+        try:
+            eng = quota_mod.QuotaEngine(db_path, default_safe_percent=95.0)
+            for mid in FREE_MODELS:
+                eng.seed_free_model(mid)
+            _quota_engine = eng
+            sys.stderr.write(
+                "[rotator] 额度引擎已启用: mode=%s db=%s 免费模型种子=%s\n"
+                % (_quota_mode(), db_path, ", ".join(FREE_MODELS)))
+        except Exception as e:
+            sys.stderr.write("[rotator] 额度引擎初始化失败，已旁路: %s\n" % str(e)[:200])
+        return _quota_engine
+
+
+def _quota_candidate(account_name, model):
+    """把现行账号快照转成引擎候选；余额字段缺失按 None（未知不拦截）。"""
+    acc = find_account(account_name) or {}
+    return quota_mod.AccountCandidate(
+        name=account_name,
+        priority=acc.get("priority", 100),
+        enabled=not acc.get("disabled") and acc.get("exhausted_date") != today(),
+        credits=acc.get("last_credits"),
+    )
+
+
+def _quota_precheck(session, model, sticky_name, quota_state):
+    """对单个候选做事前预检。返回 (reservation, skipped)。
+
+    observe 模式永不 skipped：本应 skip 的候选打 would_skip 后照常放行，
+    并仍返回一个预占凭证，保证用量照常记账（施工令第 14 条）。
+    """
+    eng = get_quota_engine()
+    if eng is None or not model:
+        return None, False
+    cand = _quota_candidate(session.name, model)
+    switched = sticky_name if sticky_name and sticky_name != session.name else None
+    reason = None
+    reservation = None
+    try:
+        reservation, reason = eng.try_reserve(cand, model, switched_from=switched)
+    except Exception as e:
+        # 引擎自身异常不得影响选号主流程，按未知放行
+        sys.stderr.write("[rotator] 额度预检异常，按放行处理(%s/%s): %s\n"
+                         % (session.name, model, str(e)[:150]))
+        return None, False
+    if reservation is not None:
+        if switched:
+            quota_state["switched_from"] = switched
+        return reservation, False
+    reason = reason or "unavailable"
+    quota_state["skip_reasons"][session.name] = reason
+    if _quota_mode() == "observe":
+        try:
+            snap = eng.get_snapshot([cand], [model])[0]
+            usage_text = "%s/%s" % (snap["success_count"], snap["safe_request_limit"])
+        except Exception:
+            usage_text = "unknown"
+        sys.stderr.write(
+            "[rotator] would_skip account=%s model=%s reason=%s usage=%s\n"
+            % (session.name, model, reason, usage_text))
+        try:
+            return eng.reserve_for_observe(
+                cand, model, reason, switched_from=switched
+            ), False
+        except Exception as e:
+            sys.stderr.write("[rotator] observe 预占失败，放行但不记账: %s\n" % str(e)[:150])
+            return None, False
+    return None, True
+
+
+# 只有「阈值」类 skip 才配得上 quota_threshold_exhausted；积分为 0、冷却等非阈值
+# 原因一律沿用现行 all_accounts_exhausted，避免把账单问题误报成阈值停手。
+_QUOTA_THRESHOLD_REASONS = {"request_threshold_reached", "token_threshold_reached"}
+
+
+def _quota_all_threshold(qstate):
+    reasons = list((qstate or {}).get("skip_reasons", {}).values())
+    return (bool(reasons)
+            and len(reasons) >= (qstate or {}).get("candidates", 0)
+            and all(r in _QUOTA_THRESHOLD_REASONS for r in reasons))
+
+
+def _quota_release(reservation, count_failure=True):
+    """释放引擎预占；引擎异常不得影响请求主流程。"""
+    if reservation is None:
+        return
+    eng = get_quota_engine()
+    if eng is None:
+        return
+    try:
+        eng.release(reservation, count_failure=count_failure)
+    except Exception as e:
+        sys.stderr.write("[rotator] 额度预占释放失败: %s\n" % str(e)[:150])
+
+
+def _quota_commit(reservation, prompt_tokens=0, completion_tokens=0):
+    """成功请求落盘用量；引擎异常不得影响已返回的响应。"""
+    if reservation is None:
+        return
+    eng = get_quota_engine()
+    if eng is None:
+        return
+    try:
+        eng.commit(reservation, prompt_tokens=prompt_tokens,
+                   completion_tokens=completion_tokens)
+    except Exception as e:
+        sys.stderr.write("[rotator] 额度用量落盘失败: %s\n" % str(e)[:150])
+
+
+def _quota_record_upstream(account, model, http_status, headers, body_text):
+    """429/402 响应观测落盘（只记不用）；失败只计数日志，不影响主流程。"""
+    global _quota_event_drop_count
+    eng = get_quota_engine()
+    if eng is None or not account or not model:
+        return
+    try:
+        hdrs = dict(headers) if headers else {}
+        eng.record_event(
+            account, model, "upstream_exhaust_response",
+            http_status=int(http_status),
+            error_code="http_%s" % http_status,
+            raw_headers=hdrs,
+            raw_body=(body_text or "")[:2000] or None,
+        )
+    except Exception:
+        _quota_event_drop_count += 1
+        sys.stderr.write("[rotator] 429/402 事件落盘失败（累计 %d 次）\n"
+                         % _quota_event_drop_count)
+
+
+def _extract_usage_tokens(obj):
+    """从聊天形态 usage 提取 prompt/completion，取不到返回 (0, 0)。"""
+    if not isinstance(obj, dict):
+        return 0, 0
+    try:
+        return (int(obj.get("prompt_tokens") or 0),
+                int(obj.get("completion_tokens") or 0))
+    except (TypeError, ValueError):
+        return 0, 0
 
 
 # ----------------------------------------------------------------------------
@@ -861,28 +1047,56 @@ _inuse = {}            # {账号名: 占用计数}
 _inuse_lock = threading.Lock()
 
 
-def pick_and_reserve(sessions, model=None, exclude=None, sticky=None):
+def pick_and_reserve(sessions, model=None, exclude=None, sticky=None, quota_state=None):
     """在 pick_available_session 之上做占用登记：选号+占用原子完成。
     sticky: 粘性记录账号，经 pick_available_session 参与优先级（pin > 粘性）。
-    全部账号均被占用时，接受共用一个未禁用账号（请求终会完成并释放），避免死锁。"""
+    全部账号均被占用时，接受共用一个未禁用账号（请求终会完成并释放），避免死锁。
+
+    二期第 1 批：候选在本层既有过滤（含占用）通过后，再过引擎 try_reserve 事前预检；
+    quota_state 可选，用于把 skip 原因与「是否全员阈值拦截」写回 _handle。
+    """
+    qstate = quota_state if quota_state is not None else {}
+    qstate.setdefault("skip_reasons", {})
+    qstate["all_threshold"] = False
+    qstate["switched_from"] = None
+    qstate["candidates"] = 0
     with _inuse_lock:
         tried_local = list(exclude or ())
         last = None
+        last_reservation = None
         for _ in range(len(sessions) + 1):
             s = pick_available_session(sessions, model, exclude=tried_local,
                                        sticky=sticky)
             if s is None:
                 break  # 无可用账号：跳出走兜底，不直接返回
-            last = s
+            qstate["candidates"] += 1
             if _inuse.get(s.name, 0) > 0:
                 tried_local.append(s.name)
+                last = s
                 continue
+            reservation, skipped = _quota_precheck(s, model, sticky, qstate)
+            if skipped:
+                # 引擎阈值拦截：换下一候选，且不参与共用兜底
+                tried_local.append(s.name)
+                continue
+            last = s
+            last_reservation = reservation
             _inuse[s.name] = _inuse.get(s.name, 0) + 1
+            s._quota_reservation = reservation
             return s
-        # 兜底：无可用账号，或全部被占用——接受共用 last（请求终会完成并释放），避免死锁
+        # 兜底：无可用账号，或全部被占用——接受共用 last（请求终会完成并释放），避免死锁。
+        # 共用路径同样要过引擎预检，否则 enforce 模式会被并发占用分支穿透。
         if last is not None:
+            if last_reservation is None and get_quota_engine() is not None and model:
+                reservation, skipped = _quota_precheck(last, model, sticky, qstate)
+                if skipped:
+                    qstate["all_threshold"] = _quota_all_threshold(qstate)
+                    return None
+                last_reservation = reservation
             _inuse[last.name] = _inuse.get(last.name, 0) + 1
+            last._quota_reservation = last_reservation
             return last
+        qstate["all_threshold"] = _quota_all_threshold(qstate)
         return None
 
 
@@ -1594,6 +1808,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 此前未取 usage，导致 stream=false 的调用 token 恒为 null，用量统计偏低。
             u = src.get("usage") if isinstance(src, dict) else None
             u = u if isinstance(u, dict) else {}
+            self._last_usage = u  # 二期第 1 批：供额度引擎 commit 记账
             log_request(ctx.get("account"), ctx.get("model"), code,
                         (time.time() - ctx["t0"]) * 1000,
                         t_in=u.get("prompt_tokens"),
@@ -1691,6 +1906,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             ctx = getattr(self, "_ctx", None)
             if ctx:
                 u = sink.get("usage") or {}
+                self._last_usage = u  # 二期第 1 批：供额度引擎 commit 记账
                 log_request(ctx.get("account"), ctx.get("model"), 200,
                             (time.time() - ctx["t0"]) * 1000,
                             t_in=u.get("prompt_tokens"),
@@ -1729,6 +1945,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             ctx = getattr(self, "_ctx", None)
             if ctx:
                 u = usage or {}
+                self._last_usage = u  # 二期第 1 批：供额度引擎 commit 记账
                 log_request(ctx.get("account"), ctx.get("model"), 200,
                             (time.time() - ctx["t0"]) * 1000,
                             t_in=u.get("prompt_tokens"),
@@ -1795,6 +2012,7 @@ def _handle(self, req_body):
     model_norm = MODEL_ALIAS.get(model_l, model_l)
     # P1 记账上下文：本次请求的模型与计时起点
     self._ctx = {"model": model_norm, "t0": time.time(), "account": None}
+    self._last_usage = None  # 请求级 usage，供额度引擎 commit 记账（防复用残留）
     if MODEL_WHITELIST and model_norm not in MODEL_WHITELIST:
         self._err(400, "model '%s' 不在白名单（仅支持: %s）"
                   % (model, ", ".join(sorted(MODEL_WHITELIST))),
@@ -1812,23 +2030,47 @@ def _handle(self, req_body):
 
     tried = []
     cur_reserved = None  # 当前占用账号，try/finally 兜底释放（修正①）
+    cur_quota_res = None  # 引擎预占凭证，与 _inuse 占用同生同死
+    quota_committed = False
+    quota_state = {"skip_reasons": {}}  # 跨切换轮次累计，用于 503 分类
+    max_switch = min(len(self.sessions), MAX_SWITCH_RETRY)
     try:
-        for _ in range(MAX_SWITCH_RETRY):
-            # 切换账号前先释放上一个占用
+        for _ in range(max_switch):
+            # 切换账号前先释放上一个占用（双预占成对释放）
             if cur_reserved:
                 release_reservation(cur_reserved)
                 cur_reserved = None
+            if cur_quota_res is not None:
+                _quota_release(cur_quota_res)
+                cur_quota_res = None
             session = pick_and_reserve(self.sessions, self._ctx["model"],
-                                       exclude=tried, sticky=sticky_account)
+                                       exclude=tried, sticky=sticky_account,
+                                       quota_state=quota_state)
             if session is None:
-                self._err(503, "所有账号今日额度已耗尽（已尝试: %s）。明日自动恢复，或执行 reset。"
-                          % (", ".join(tried) or "无可用账号"),
-                          "all_accounts_exhausted")
+                if quota_state.get("all_threshold"):
+                    self._err(
+                        503,
+                        "所有账号对该模型均已达到安全阈值（已尝试: %s）。"
+                        "为保护剩余额度主动停手，并非真实耗尽。"
+                        % (", ".join(tried) or "无可用账号"),
+                        "quota_threshold_exhausted")
+                else:
+                    self._err(503, "所有账号今日额度已耗尽（已尝试: %s）。明日自动恢复，或执行 reset。"
+                              % (", ".join(tried) or "无可用账号"),
+                              "all_accounts_exhausted")
                 return
             cur_reserved = session.name
-            # 粘性记录回写：仅账号变化时写，稳定会话不重复落盘
-            if sticky_key and sticky_account != session.name:
+            cur_quota_res = getattr(session, "_quota_reservation", None)
+            # 粘性记录回写：账号变化时写；pin 命中的服务不刷新（二期第 1 批）
+            pinned_now = get_pinned()
+            pin_name = (resolve_name(pinned_now, [s.name for s in self.sessions])
+                        if pinned_now else None)
+            if (sticky_key and sticky_account != session.name
+                    and pin_name != session.name):
                 _save_sticky(sticky_key, session.name)
+                if quota_state.get("switched_from"):
+                    sys.stderr.write("[rotator] 额度阈值切号 %s → %s，粘性绑定已刷新\n"
+                                     % (quota_state["switched_from"], session.name))
                 sticky_account = session.name
             tried.append(session.name)
             self._ctx["account"] = session.name
@@ -1859,6 +2101,12 @@ def _handle(self, req_body):
                     err_text = e.read().decode("utf-8", "replace")
                 except Exception:
                     pass
+                # 二期第 1 批：429/402 只观测落盘，不启用引擎自带冷却/耗尽
+                # （现行 mark_model 的 600s soft + exhausted_date 是唯一状态通道）
+                if e.code in EXHAUST_HTTP_CODES:
+                    _quota_record_upstream(
+                        session.name, self._ctx["model"], e.code,
+                        getattr(e, "headers", None), err_text)
                 if is_exhausted_response(e.code, err_text):
                     cur = session.current() or {}
                     if e.code == 429:
@@ -1915,6 +2163,15 @@ def _handle(self, req_body):
                 else:
                     result["rotator"] = {"account": session.name}
                     self._json(200, result)
+            # 二期第 1 批：成功请求把用量落进引擎账本（usage 取不到按 0 计并标注）
+            u = getattr(self, "_last_usage", None)
+            if not isinstance(u, dict) or not u:
+                sys.stderr.write("[rotator] 本次响应未取到 usage，额度记账按 0 token: %s/%s\n"
+                                 % (session.name, self._ctx["model"]))
+            pt, ct = _extract_usage_tokens(u)
+            if cur_quota_res is not None:
+                _quota_commit(cur_quota_res, pt, ct)
+                quota_committed = True
             # 项2: 成功则清零该账号/模型熔断记录（试探成功恢复）
             _record_circuit_success(session.name, self._ctx["model"])
             return
@@ -1922,9 +2179,12 @@ def _handle(self, req_body):
         # 修正①: 任何退出路径（成功/失败/异常/切换/耗尽）都兜底释放占用，不漏放 _inuse 计数
         if cur_reserved:
             release_reservation(cur_reserved)
+        # 双预占同生同死：未 commit 的引擎预占一律释放
+        if cur_quota_res is not None and not quota_committed:
+            _quota_release(cur_quota_res)
 
     self._err(503, "连续切换 %d 个账号仍失败（已尝试: %s%s）" % (
-        MAX_SWITCH_RETRY, ", ".join(tried),
+        max_switch, ", ".join(tried),
         ("；最后网络错误: " + self._last_net_err)
         if getattr(self, "_last_net_err", None) else ""),
         "switch_limit_reached")
@@ -1947,6 +2207,9 @@ def cmd_serve(args):
     accounts.sort(key=lambda a: a.get("priority", 100))
     save_accounts(accounts)
     ProxyHandler.sessions = [AccountSession(a["name"]) for a in accounts]
+    # 二期第 1 批：启动时幂等建表并种免费模型规则；WB_QUOTA_ENABLED=0 时完全不触碰 DB
+    if _quota_enabled():
+        get_quota_engine()
 
     server = ThreadingHTTPServer((args.host, args.port), ProxyHandler)
     print("🚀 WorkBuddy 账号轮换代理已启动")
@@ -1955,6 +2218,8 @@ def cmd_serve(args):
     print("   账号池(%d): %s" % (len(accounts),
           " → ".join(a["name"] + ("⭐" if a.get("priority", 100) == 1 else "") for a in accounts)))
     print("   切换策略: 额度耗尽自动切下一账号，跨日自动恢复")
+    print("   额度引擎: %s mode=%s（WB_QUOTA_ENABLED=0 为回滚旁路）"
+          % ("on" if get_quota_engine() else "off", _quota_mode()))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

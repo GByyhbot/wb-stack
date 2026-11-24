@@ -16,6 +16,9 @@ services:
       WB_DB_PATH: /data/manager/wb_manager.db
       WB_ROTATOR_HOME: /data/rotator
       WB_BACKUP_DIR: /data/backup
+      # 二期第 1 批：observe 先行；WB_QUOTA_ENABLED=0 为回滚旁路开关
+      WB_QUOTA_ENABLED: "1"
+      WB_QUOTA_MODE: "observe"
       WB_PORT_MANAGER: "8300"
       WB_PORT_ROTATOR: "8310"
       TZ: Asia/Shanghai

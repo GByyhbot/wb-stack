@@ -73,6 +73,7 @@ def build_archive():
         ".dockerignore",
         "wb-manager/requirements.txt",
         "wb-rotator/rotator.py",
+        "wb-rotator/quota_engine.py",
         "deploy/Dockerfile",
         "deploy/Dockerfile.hotfix",
         "deploy/docker-compose.yml",
