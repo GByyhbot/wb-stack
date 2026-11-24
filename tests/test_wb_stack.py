@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sqlite3
 import sys
 import urllib.error
@@ -296,6 +297,17 @@ def test_recommendation_expiry_first(rec):
     assert m["backup"]["account"] == "富裕号"
     assert sum(s["suggested_requests"] for s in m["shares"]) == 20   # 日均 140/7
     assert any(r["type"] == "expiring" and r["account"] == "临期号" for r in out["risks"])
+
+
+def test_recommendation_risk_credits_two_decimals(rec):
+    """面板改版批并入修复：风险文案里的浮点积分不得出现超两位小数噪声。"""
+    accounts = [_acc("临期号", available=1463.36000227, days_left=0)]
+    out = rec.build_recommendation(accounts, {}, {}, window_days=7)
+    msgs = [r["message"] for r in out["risks"] if r["type"] == "expiring"]
+    assert msgs, "应生成临期风险"
+    msg = msgs[0]
+    assert "1463.36" in msg
+    assert not re.search(r"\d+\.\d{3,}", msg), msg
 
 
 def test_recommendation_respects_limits(rec):

@@ -191,7 +191,7 @@ def build_recommendation(accounts, usage, limits, window_days=7):
         account_recs.append(rec)
         if dl is not None and dl <= 3 and avail:
             risks.append({"type": "expiring", "account": name,
-                          "message": "账号「%s」的 %s 可用积分 %s 天后到期，建议优先消耗"
+                          "message": "账号「%s」的 %.2f 可用积分 %s 天后到期，建议优先消耗"
                                      % (name, avail, dl)})
         if avail is not None and avail <= 0:
             risks.append({"type": "exhausted", "account": name,
