@@ -17,6 +17,11 @@ __pycache__/
 *.pyo
 .pytest_cache/
 
+# ===== wb-web 前端工程 =====
+wb-web/node_modules/
+# Vite 构建产物：容器内多阶段构建产出，仓库不落盘
+wb-manager/static/dist/
+
 # ===== 编辑器与系统 =====
 .DS_Store
 Thumbs.db

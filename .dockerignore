@@ -22,3 +22,6 @@ deploy/data/**
 deploy/.env
 deploy/deploy.py
 export_second_rt.bat
+# 前端工程：依赖目录不进构建上下文（容器内 npm ci 重建）；本地 dist 不进镜像（容器内构建产出）
+wb-web/node_modules/**
+wb-manager/static/dist/**

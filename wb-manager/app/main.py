@@ -115,9 +115,19 @@ class SwitchRequest(BaseModel):
 
 @app.get("/")
 async def index():
+    # 新版 wb-web 构建产物（static/dist/index.html）存在则优先返回；
+    # 缺失（纯 Python 环境 / 未构建 / 回滚删除）时自动回退旧版单文件页面。
     # 与 /static 挂载同口径：按文件位置解析，不依赖启动 CWD（相对路径曾让
     # 非 wb-manager 目录启动时首页 500）
-    return FileResponse(str(Path(__file__).resolve().parent.parent / "static" / "index.html"))
+    if _STATIC_DIST_INDEX.is_file():
+        return FileResponse(str(_STATIC_DIST_INDEX))
+    return FileResponse(str(_STATIC_INDEX))
+
+
+@app.get("/legacy")
+async def legacy_index():
+    # 固定返回旧版单文件面板（重构前的 static/index.html），零停机应急回退入口
+    return FileResponse(str(_STATIC_INDEX))
 
 
 # ---------- 用量统计（读取 rotator 的请求记账日志） ----------
@@ -1048,4 +1058,12 @@ def api_switch_consume(req: SwitchRequest):
 # 静态目录按文件位置解析，不依赖启动时的工作目录（此前相对路径 "static"
 # 要求进程必须从 wb-manager/ 启动，换个 CWD 直接 RuntimeError 起不来）
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+_STATIC_INDEX = _STATIC_DIR / "index.html"       # 旧版单文件（/legacy 兜底与回滚基准）
+_STATIC_DIST_DIR = _STATIC_DIR / "dist"          # wb-web 前端构建产物（Vite，可缺省）
+_STATIC_DIST_INDEX = _STATIC_DIST_DIR / "index.html"
+_STATIC_DIST_ASSETS = _STATIC_DIST_DIR / "assets"
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+# 新版前端带 hash 的静态资源：仅当 dist/assets 目录存在时挂载，
+# 纯 Python 单元测试环境 / 未构建产物时不挂载，避免 StaticFiles 初始化报错
+if _STATIC_DIST_ASSETS.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(_STATIC_DIST_ASSETS)), name="assets")
