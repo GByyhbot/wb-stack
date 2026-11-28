@@ -351,7 +351,7 @@ async function confirmDelete() {
         </div>
       </template>
       <div v-else-if="store.activeError" class="text-xs text-[var(--amber)]">
-        ⚠️ 没有可用账号：{{ store.activeError }}
+        ⚠️ {{ store.activeError }}
       </div>
       <div v-else class="text-xs text-[var(--text-muted)]">加载中…</div>
     </div>
