@@ -25,7 +25,7 @@ RUN pip install --no-cache-dir --timeout 60 --retries 5 \
 
 COPY wb-manager/app /app/app
 COPY wb-manager/static /app/static
-COPY --from=frontend-builder /app/wb-manager/static/dist /app/wb-manager/static/dist
+COPY --from=frontend-builder /app/wb-manager/static/dist /app/static/dist
 COPY wb-rotator/rotator.py /app/rotator.py
 COPY wb-rotator/quota_engine.py /app/quota_engine.py
 COPY deploy/entrypoint.py /app/entrypoint.py
